@@ -272,3 +272,39 @@ vDSO 正确地回退到系统调用；amd64/arm64 同理。Java 端到端 `nanoT
 C++ 工具链，而本移植刻意没有（runsc 是纯 Go，交叉编译用不着）。所以 vDSO 在龙芯机上
 （或用 loongarch 交叉 g++）单独编好后把产物提交。注意 `check_vdso.py` 对 locale 敏感
 （它判断 `readelf -r` 输出是否为空），必须 `LC_ALL=C` 运行。
+
+### ② futex 屏障：已验证有 25× 空间，但保守起见未采用 (2026-08-18)
+
+`futex.WaitPrepare` 在每次真正阻塞前调用 `GlobalMemoryBarrier()`，它落到
+`membarrier(MEMBARRIER_CMD_GLOBAL)`——内核里就是 `synchronize_rcu()`，等一个系统级
+RCU 宽限期，毫秒量级。上游选这个慢命令是合理的：它只在实现 `membarrier(2)` 时偶尔调一次。
+本移植把它放到了 futex 热路径上，代价极大。
+
+试过改用 `MEMBARRIER_CMD_GLOBAL_EXPEDITED`（IPI 实现，微秒级），实测：
+
+| 指标 | GLOBAL | GLOBAL_EXPEDITED | runc |
+|---|---|---|---|
+| park/unpark | 15.34 ms/hop | 0.28 ms/hop | 0.01 ms |
+| wait/notify | 9.90 ms | 1.39 ms | 1.26 ms |
+| fork/exec | 72 ms | 18 ms | 2 ms |
+| Java 全套总耗时 | 156 s | 4.5 s | 2.3 s |
+
+浸泡 50 轮 JVM 启动 + 15000 次 park/unpark，零失败零丢失唤醒。
+
+**但已回退，未采用。** 原因是一个无法自证的正确性问题：`GLOBAL_EXPEDITED` 只向注册过
+`REGISTER_GLOBAL_EXPEDITED` 的进程所在 CPU 发 IPI，而这个屏障需要命中的是 **stub 进程**
+（让 stub 的写对 sentry 可见），stub 从未注册——改动只在 sentry 里注册。是否有效完全取决于
+Linux 在 fork 时会不会继承 `mm->membarrier_state`，未能确认。若不继承，等于退回无屏障状态，
+当初的 JVM 启动死锁可能以极低概率复发，这种偶发故障在生产上代价太高。
+
+将来若要拿这 25×，正确做法是**让 stub 自己注册**（ptrace 平台本就具备向 stub 注入系统调用的
+能力），而不是只在 sentry 注册。
+
+两个配套注意事项：
+
+- gVisor 自己的 seccomp 只放行 `MEMBARRIER_CMD_GLOBAL`
+  （`runsc/boot/filter/config/config_main.go`）。换命令必须同步放行，否则 sentry 一发出新命令
+  就被 SIGSYS 打死，容器退出码 159、无任何输出。
+- 那段代码是"屏障 + 重新检查"，而两次检查**都在 `b.mu` 锁内**。bucket 锁加上 stub 陷入内核的
+  上下文切换本身可能已经提供了足够的顺序保证——屏障当初之所以奏效，也可能只是因为它引入了
+  毫秒级延迟让写落地。若真如此，任何缩短该延迟的改动都在缩小安全边际。这是保守选择的另一个理由。

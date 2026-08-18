@@ -461,7 +461,6 @@ func (mm *MemoryManager) CompareAndSwapUint32(ctx context.Context, addr hostarch
 	return prev, err
 }
 
-// LoadUint32 implements usermem.IO.LoadUint32.
 // MemoryBarrier issues a host global memory barrier so writes by peer tasks
 // (stub processes) sharing this address space become globally visible to the
 // sentry. Required on weakly-ordered platforms (LoongArch) where the ptrace
@@ -473,6 +472,7 @@ func (mm *MemoryManager) MemoryBarrier() {
 	}
 }
 
+// LoadUint32 implements usermem.IO.LoadUint32.
 func (mm *MemoryManager) LoadUint32(ctx context.Context, addr hostarch.Addr, opts usermem.IOOpts) (uint32, error) {
 	ar, ok := mm.CheckIORange(addr, 4)
 	if !ok {
