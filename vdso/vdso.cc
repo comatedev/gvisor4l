@@ -155,6 +155,60 @@ extern "C" int __kernel_clock_getres(clockid_t clock, struct timespec* res) {
   return ret;
 }
 
+#elif __loongarch64
+
+// LoongArch exports the __vdso_* spellings like x86_64 does, not the
+// __kernel_* ones used on arm64; see arch/loongarch/vdso/vdso.lds.S. The
+// sigreturn trampoline is published under both names because glibc looks for
+// __vdso_rt_sigreturn while the kernel's own users look for __kernel_.
+
+// __vdso_clock_gettime() implements clock_gettime()
+extern "C" int __vdso_clock_gettime(clockid_t clock, struct timespec* ts) {
+  return __common_clock_gettime(clock, ts);
+}
+
+// __vdso_gettimeofday() implements gettimeofday()
+extern "C" int __vdso_gettimeofday(struct timeval* tv, struct timezone* tz) {
+  return __common_gettimeofday(tv, tz);
+}
+
+// __vdso_clock_getres() implements clock_getres()
+extern "C" int __vdso_clock_getres(clockid_t clock, struct timespec* res) {
+  int ret = 0;
+
+  switch (clock) {
+    case CLOCK_REALTIME:
+    case CLOCK_MONOTONIC:
+    case CLOCK_BOOTTIME: {
+      if (res == nullptr) {
+        return 0;
+      }
+
+      res->tv_sec = 0;
+      res->tv_nsec = 1;
+      break;
+    }
+
+    default:
+      ret = sys_clock_getres(clock, res);
+      break;
+  }
+
+  return ret;
+}
+
+// __vdso_getcpu() implements getcpu()
+extern "C" long __vdso_getcpu(unsigned* cpu, unsigned* node,
+                              struct getcpu_cache* cache) {
+  // No optimizations yet, just make the real system call.
+  return sys_getcpu(cpu, node, cache);
+}
+
+// __vdso_rt_sigreturn() is the second spelling of the trampoline defined above.
+extern "C" void __vdso_rt_sigreturn(unsigned long unused) {
+  sys_rt_sigreturn();
+}
+
 #else
 #error "unsupported architecture"
 #endif

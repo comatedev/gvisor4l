@@ -227,3 +227,48 @@ SIGSEGV，落在非规范地址才触发 LoongArch 的 ADE 例外变成 SIGBUS�
 "偶尔"看到 Bus error。
 
 代价：fork 变成 O(堆大小)。192MB 堆的 JVM 上，fork 从 2ms 涨到约 76ms。
+
+## 性能优化
+
+### ① vDSO：clock_gettime 37500ns → 34ns (2026-08-18)
+
+移植初期的 `vdso_loong64_stub.so` 只是个让 `vdso.PrepareVDSO()` 能解析下去的占位——
+导出符号一律返回 -1，glibc 于是每次 `clock_gettime` 都回落到真实系统调用，被 ptrace
+拦截后约 37.5µs。JVM 对 nanoTime 的调用极其频繁，这是 Java 负载上最大的单项开销。
+
+现在是一个真正的 vDSO，由 `vdso/vdso.cc` + `vdso_time.cc` 编译而来，直接从 sentry
+维护的参数页算时间，不进内核。新增的架构分支：
+
+| 文件 | 内容 |
+|---|---|
+| `cycle_clock.h` | `rdtime.d %0, $zero` 读稳定计数器——必须与 sentry 的 `tsc_loong64.s` 同源，否则参数页里的 cycle 值对我们没有意义 |
+| `barrier.h` | `dbar 0`。Vol1 §2.2.8.1 只保证 hint=0 是完整屏障，细粒度 hint 是可选的 |
+| `syscalls.h` | `syscall 0` 回退桩；$a7 传号，$a0-$a5 传参，$a0 返回 |
+| `vdso_time.cc` | `la.pcrel` 定位参数页，链接期解析，零动态重定位 |
+| `vdso.cc` | 六个 `__vdso_*` 导出。LoongArch 用 `__vdso_` 拼写（同 x86_64），不是 arm64 的 `__kernel_` |
+
+**最大的坑是页大小。** `vdso_loong64.lds` 原本照抄了 amd64/arm64 的
+`_params = VDSO_PRELINK - 0x1000`，但 `pkg/sentry/loader/vdso.go:216` 是按
+`hostarch.PageSize` 分配参数页的，LoongArch 上等于 **16K**。于是 vDSO 跑去
+`vdso_base - 0x1000`（页中间的空白）读参数，`ready` 恒为 0，**静默回退到系统调用且
+不报任何错**——现象是"vDSO 装上了但一点没变快"。改成 `- 0x4000` 才对。
+
+定位它的关键线索是应用侧 `/proc/self/maps` 里 `[vvar]` 段的长度为 `0x4000`。
+
+实测（`vdsoprobe`，3A5000）：
+
+| | clock_gettime |
+|---|---|
+| 宿主裸跑 | 38 ns |
+| 修复前（桩） | 37500 ns |
+| 修复后（冷，沙箱刚启动） | 9400 ns |
+| 修复后（热） | **34 ns** |
+
+冷启动那段是 gVisor 时钟校准的固有热身窗口：单调钟要等几个更新周期才发布参数，其间
+vDSO 正确地回退到系统调用；amd64/arm64 同理。Java 端到端 `nanoTime` 从 37497ns 降到
+507ns（该均值含热身窗口，稳态即上表的 34ns）。
+
+构建走 `scripts/build-vdso-loong64.sh`——`//vdso:vdso` 那个 genrule 需要**目标架构**的
+C++ 工具链，而本移植刻意没有（runsc 是纯 Go，交叉编译用不着）。所以 vDSO 在龙芯机上
+（或用 loongarch 交叉 g++）单独编好后把产物提交。注意 `check_vdso.py` 对 locale 敏感
+（它判断 `readelf -r` 输出是否为空），必须 `LC_ALL=C` 运行。

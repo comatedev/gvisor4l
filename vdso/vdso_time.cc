@@ -71,6 +71,17 @@ inline struct params* get_params() {
   return p;
 }
 
+#elif __loongarch64
+
+inline struct params* get_params() {
+  struct params* p = nullptr;
+  // la.pcrel expands to pcalau12i+addi.d. _params is fixed by the linker
+  // script relative to VDSO_PRELINK, so this resolves at link time and leaves
+  // no dynamic relocation behind.
+  asm("la.pcrel %0, _params" : "=r"(p) : :);
+  return p;
+}
+
 #else
 #error "unsupported architecture"
 #endif

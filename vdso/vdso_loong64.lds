@@ -19,8 +19,16 @@ OUTPUT_FORMAT("elf64-loongarch", "elf64-loongarch", "elf64-loongarch")
 OUTPUT_ARCH(loongarch64)
 
 SECTIONS {
-  /* The parameter page is mapped just before the VDSO. */
-  _params = VDSO_PRELINK - 0x1000;
+  /*
+   * The parameter page is mapped just before the VDSO. Note the 0x4000: the
+   * sentry allocates it as one hostarch.PageSize (see vdso.go's
+   * mf.Allocate(hostarch.PageSize)) and places the VDSO immediately after it,
+   * and LoongArch pages are 16K. The amd64/arm64 scripts say 0x1000 because
+   * their pages are 4K -- copying that value here silently points _params into
+   * the middle of the page, every read returns zero, and the VDSO falls back
+   * to the syscall on every call.
+   */
+  _params = VDSO_PRELINK - 0x4000;
 
   . = VDSO_PRELINK + SIZEOF_HEADERS;
 

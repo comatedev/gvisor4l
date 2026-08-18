@@ -42,6 +42,18 @@ static inline uint64_t cycle_clock(void) {
   return val;
 }
 
+#elif __loongarch64
+
+static inline uint64_t cycle_clock(void) {
+  uint64_t val;
+  // rdtime.d rd, rj: rd receives the stable counter and rj the counter ID,
+  // which we discard into $zero. This is the same counter the sentry samples
+  // in pkg/sentry/time/tsc_loong64.s; reading anything else here would make
+  // the cycle values in the parameter page meaningless to us.
+  asm volatile("rdtime.d %0, $zero" : "=r"(val)::"memory");
+  return val;
+}
+
 #else
 #error "unsupported architecture"
 #endif

@@ -22,7 +22,7 @@ go_library(
     ],
     embedsrcs = [
         ":vdso_arch",  # keep
-        "vdso_loong64_stub.so",
+        "vdso_loong64.so",
     ],
     marshal = False,
     stateify = False,

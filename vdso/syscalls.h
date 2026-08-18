@@ -92,6 +92,59 @@ static inline void sys_rt_sigreturn(void) {
                "svc #0 \n");
 }
 
+#elif __loongarch64
+
+struct getcpu_cache;
+
+// LoongArch takes the syscall number in $a7 and arguments in $a0..$a5, and
+// returns in $a0 (ELF psABI v2.01, Table 1). `syscall 0` is the trap.
+
+static inline int sys_clock_gettime(clockid_t _clock, struct timespec* _ts) {
+  register clockid_t clock asm("$a0") = _clock;
+  register struct timespec* ts asm("$a1") = _ts;
+  register long nr asm("$a7") = __NR_clock_gettime;
+  register long ret asm("$a0");
+
+  asm volatile("syscall 0\n"
+               : "=r"(ret)
+               : "r"(clock), "r"(ts), "r"(nr)
+               : "memory");
+  return ret;
+}
+
+static inline int sys_clock_getres(clockid_t _clock, struct timespec* _ts) {
+  register clockid_t clock asm("$a0") = _clock;
+  register struct timespec* ts asm("$a1") = _ts;
+  register long nr asm("$a7") = __NR_clock_getres;
+  register long ret asm("$a0");
+
+  asm volatile("syscall 0\n"
+               : "=r"(ret)
+               : "r"(clock), "r"(ts), "r"(nr)
+               : "memory");
+  return ret;
+}
+
+static inline int sys_getcpu(unsigned* _cpu, unsigned* _node,
+                             struct getcpu_cache* _cache) {
+  register unsigned* cpu asm("$a0") = _cpu;
+  register unsigned* node asm("$a1") = _node;
+  register struct getcpu_cache* cache asm("$a2") = _cache;
+  register long nr asm("$a7") = __NR_getcpu;
+  register long ret asm("$a0");
+
+  asm volatile("syscall 0\n"
+               : "=r"(ret)
+               : "r"(cpu), "r"(node), "r"(cache), "r"(nr)
+               : "memory");
+  return ret;
+}
+
+static inline void sys_rt_sigreturn(void) {
+  asm volatile("li.d $a7, " __stringify(__NR_rt_sigreturn) "\n"
+               "syscall 0\n");
+}
+
 #else
 #error "unsupported architecture"
 #endif

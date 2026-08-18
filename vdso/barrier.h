@@ -40,6 +40,21 @@ inline void write_barrier(void) {
   __asm__ __volatile__("dmb ishst" ::: "memory");
 }
 
+#elif __loongarch64
+
+// `dbar 0` is the hint LoongArch guarantees to be a complete barrier
+// (Vol1 §2.2.8.1). The finer-grained hints are optional, and on 3A5000 they
+// degrade to a full barrier anyway, so there is nothing to win by using them.
+inline void memory_barrier(void) {
+  __asm__ __volatile__("dbar 0" ::: "memory");
+}
+inline void read_barrier(void) {
+  __asm__ __volatile__("dbar 0" ::: "memory");
+}
+inline void write_barrier(void) {
+  __asm__ __volatile__("dbar 0" ::: "memory");
+}
+
 #else
 #error "unsupported architecture"
 #endif
