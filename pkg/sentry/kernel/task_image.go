@@ -97,6 +97,10 @@ func (image *TaskImage) Fork(ctx context.Context, k *Kernel, shareAddressSpace b
 		// COW-fault (PME) SIGSEGV path, which does not restore page-walk
 		// temporaries t0/t1 and corrupts application registers.
 		image.MemoryManager.PopulateAll(ctx)
+		// Parent first: once the parent has broken COW, the child holds the only
+		// reference to the original pages, so its pass takes the HasUniqueRef
+		// fast path in isPMACopyOnWriteLocked and re-owns them without copying.
+		newMM.PopulateAll(ctx)
 	}
 	return newImage, nil
 }
