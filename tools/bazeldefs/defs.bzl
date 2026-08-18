@@ -80,11 +80,12 @@ def amd64_config(settings, attr):
     }
 
 def loong64_config(settings, attr):
+    # Unlike amd64_config/arm64_config, this sets no cpu or crosstool_top:
+    # @crosstool is the coral crosstool, which has no loongarch64 support. It is
+    # not needed either, since //runsc:runsc is pure Go. Note that this
+    # transition is currently not wired into //tools:arch.bzl.
     return {
-        # See above.
         "@io_bazel_rules_go//go/config:race": False,
-        "//command_line_option:cpu": "loongarch64",
-        "//command_line_option:crosstool_top": "@crosstool//:toolchains",
         "//command_line_option:platforms": "@io_bazel_rules_go//go/toolchain:linux_loong64",
     }
 

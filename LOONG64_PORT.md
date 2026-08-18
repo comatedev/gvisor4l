@@ -10,7 +10,7 @@
 
 | 决策 | 选择 | 理由 |
 |---|---|---|
-| 构建路径 | `docker buildx` + loong64 容器内 Bazel | 跳过 `cc_toolchain_loongarch64` 配置；隐藏 bug 立刻暴露 |
+| 构建路径 | x86_64 上 `bazel build --config=loong64` 交叉编译 | 官方 Bazel 无 loongarch64 二进制；`//runsc:runsc` 纯 Go 免 cgo，无需 `cc_toolchain_loongarch64` |
 | 页大小 | 仅支持 16K（不分 4k/64k 变体） | Linux 主线 LoongArch 默认；银河麒麟 V11 内核 6.6 默认 |
 | FPU 保存 | 仅基础 32×64bit FP + FCC + FCSR | LSX/LASX 在 `cpuid.AllowedHWCap1` 中过滤掉，使 glibc/JVM 不去用 |
 | KVM/systrap/ring0 | 全部 panic stub | 这些子系统在 ptrace 平台不会触发；占位让代码树能编译 |
@@ -99,15 +99,82 @@ P1.B 写完后通过两份官方 PDF 校对，结论：
 - 3A5000 支持 AM\* 原子指令（Vol1 §2.2.10.5: CPUCFG bit22 LAM=1），未来若 LL/SC 性能不够可切到 `AMSWAP_DB.D` 等。
 - e_machine = 258 (EM_LOONGARCH) 确认（ELF psABI Table 5），与 `AUDIT_ARCH_LOONGARCH64=0xc0000102` 推算一致。
 
-## 编译指引（占位，待 P1.D 完成后填充）
+## 编译指引
+
+**在 x86_64 Linux 机器上交叉编译**。Bazel 官方不发布 linux-loongarch64 二进制，
+龙芯机上跑不了 Bazel，所以构建机固定为 x86。这不付出任何代价：`//runsc:runsc` 是
+`pure = True` 纯 Go，Go 工具链直接交叉编译，**全程不涉及 LoongArch C 工具链**；
+vDSO 是预编译提交的 `pkg/sentry/loader/vdsodata/vdso_loong64_stub.so`，不参与构建。
 
 ```bash
-# x86 编译机
-docker buildx use loong-builder        # 复用已有 instance
-docker run --rm --platform=linux/loong64 ghcr.io/loong64/debian:trixie-slim uname -m
-./scripts/build-runsc.sh
-# 产出 bazel-bin/runsc/runsc_/runsc (linux/loong64)
+./scripts/build-runsc.sh          # 产出 ./bin/runsc (linux/loong64)
+MODE=opt ./scripts/build-runsc.sh # 生产版，剥调试信息
 ```
+
+底层就是一条 bazel 命令：
+
+```bash
+bazel build --config=loong64 //runsc:runsc
+```
+
+`--config=loong64` 定义在 `.bazelrc`，只设 `--platforms`，**不设 `--crosstool_top`**
+—— `@crosstool` 是 coral crosstool，只有 k8/aarch64，没有 loongarch64；纯 Go 也不需要它。
+
+`--platforms` 必须显式传。`//tools/bazeldefs:loong64` 这个 config_setting 认的是
+`@platforms//cpu:loongarch64` 约束，匹配不上时 `select_goarch()` 会**静默**落到默认
+分支，编出错误架构的二进制而不报错。脚本因此在最后校验产物的
+`e_machine == 258 (EM_LOONGARCH)`，并在 x86 上用 qemu-user 跑一次 `runsc --version`
+做冒烟自检。
+
+构建机要求：
+
+| 项 | 要求 |
+|---|---|
+| 架构 | x86_64 Linux |
+| Bazel | 8.3.1（`.bazelversion` → `images/default/bazelversion`） |
+| Go | 1.26.3，由 `go_sdk.from_file` 按 go.mod 自动下载，无需预装 |
+| 依赖补丁 | 4 个，见下（rules_go / platforms / gazelle ×2） |
+| 软件包 | `build-essential git python3 zip unzip patch pkg-config libssl-dev` **外加 `crossbuild-essential-arm64 clang libc6-dev-i386 binutils-gold`**（缺一不可，见下）；可选 `qemu-user` 供冒烟自检 |
+| 磁盘 / 内存 | ≥20G bazel 缓存，≥8G 内存 |
+| 网络 | 需可达 BCR、GitHub releases（rules_go zip）、go.dev/dl；受限网络需配 `--registry` 镜像与 `GOPROXY` |
+
+### 四个依赖补丁
+
+| 补丁 | 作用 |
+|---|---|
+| `rules_go_loong64.patch` | 把 `loong64 → @platforms//cpu:loongarch64` 加进 `BAZEL_GOARCH_CONSTRAINTS`，并注册 `("linux","loong64")` |
+| `platforms_loongarch64.patch` | 在 `@platforms` 里补出 `cpu:loongarch64` 这个 constraint_value |
+| `gazelle_loong64_platform.patch` | 给 gazelle 的 `KnownPlatforms` 加 `{"linux","loong64"}` |
+| `gazelle_loong64_platform_info.patch` | 给 gazelle 的 `IsKnownArch()` 加 `"loong64"` |
+
+前两个决定 `--platforms` 能不能匹配上；后两个决定**外部 Go 依赖的 BUILD 文件生成**。
+
+gazelle 这两个是 2026-08-18 才补上的，之前一直缺，症状极具误导性：编译
+`com_github_creack_pty` 报 `_C_int` / `_C_uint` undefined。**gazelle 在为外部 Go 模块
+生成 BUILD 时，会静默丢弃构建约束里出现未知架构的源文件** —— gazelle 0.47 的
+`IsKnownArch()` 里没有 loong64，于是上游自带的 `ztypes_loong64.go` 根本没进 srcs。
+同时被丢掉的还有 `ztypes_sparcx.go`、`ztypes_freebsd_ppc64.go` 等，这个规律是定位的关键。
+
+注意 Bazel 内置的 patch 实现（非 GNU patch）**处理多文件补丁时会把 hunk 归错文件**，
+所以 gazelle 的两处改动必须拆成两个补丁文件。
+
+曾经还有一个 `creack_pty_loong64.patch` 用来补 `_C_int`，已删除：creack/pty v1.1.24
+上游本来就有 `ztypes_loong64.go`，那个补丁不但多余，而且在 gazelle 修好之前也永远
+不可能生效（文件照样会被过滤掉）。
+
+### 环境踩坑
+
+| 现象 | 根因 | 解法 |
+|---|---|---|
+| `/usr/bin/aarch64-linux-gnu-gcc: No such file` | `arch_genrule` 会给 amd64 **和 arm64** 都编 systrap sighandler，与目标平台无关 | `crossbuild-essential-arm64` |
+| `clang: command not found` | eBPF 程序的 genrule 用 clang 编 BPF 目标码 | `clang` |
+| `fatal error: 'gnu/stubs-32.h' file not found` | 同上，amd64 上编 eBPF 需要 32 位头文件 | `libc6-dev-i386` |
+| `collect2: fatal error: cannot find 'ld'` | **极具迷惑性**：`ld` 明明存在。真相是 bazel 传了 `-fuse-ld=gold`，而 GNU gold 在 binutils 2.44 之后已被上游移除 | `binutils-gold`（装完确认 `/usr/bin/ld` 仍指向 bfd） |
+
+诊断 `cannot find 'ld'` 的关键是去看 params 文件里的链接参数，而不是去查 `ld` 在不在。
+
+注意 `.bazelversion` 在 git 里是符号链接（mode 120000），在不支持符号链接的检出
+（如 Windows）上会变成内容为路径的文本文件，bazelisk 会因此失败。
 
 ## 部署到银河麒麟（占位）
 
@@ -124,7 +191,7 @@ docker run --rm --runtime=runsc --network=none oj-c:loong64 \
 
 `docker run --runtime=runsc ghcr.io/loong64/debian:trixie-slim echo hello` → **hello** (exit 0)，在银河麒麟 V11 LoongArch64 (3A5000, 内核 6.6) 上验证。
 
-### 运行期 bug 修复链 (v3→v12)
+### 运行期 bug 修复链 (v3→v13)
 | 版本 | 根因 | 修复 |
 |---|---|---|
 | v3 | LoongArch 内核忽略 mmap hint → stub 地址死循环 | stub mmap 加 `MAP_FIXED_NOREPLACE` (pkg/sentry/platform/ptrace/stub_unsafe.go) |
@@ -134,5 +201,29 @@ docker run --rm --runtime=runsc --network=none oj-c:loong64 \
 | v8 | gofer host seccomp 缺 statx → SIGSYS 杀进程 | fsgofer/filter/config_loong64.go 补 SYS_STATX (LoongArch 无 fstat) |
 | v9 | 未注册 LoongArch syscall dispatch table → "no syscall table found" | 新建 syscalls/linux/linux64_loong64.go，复用 ARM64.Table (asm-generic 编号一致) |
 | v12 | **syscall arg0 取错**：LoongArch 内核 entry 先存 orig_a0 再设 a0=-ENOSYS；SyscallSaveOrig 误用 a0 覆盖 orig_a0 | SyscallSaveOrig 空实现；SyscallArgs 直接读 c.Regs.OrigA0 (syscalls_loong64.go) |
+| v13 | **fork 子进程漏掉 eager populate**：`TaskImage.Fork` 的注释写着 "break COW eagerly on both parent and child"，代码却只对父进程调用了 `PopulateAll`。子进程的 pma 全部 needCOW、被映射为只读，第一次写栈必然缺页，踩中内核 tlbex 不恢复 t0/t1 的缺陷 | task_image.go 补上 `newMM.PopulateAll(ctx)` |
 
 关键诊断手段：x86 host 上 qemu-user + bazel 交叉编译迭代；龙芯机上 strace gofer + sentry --strace + 在 SyscallArgs 临时 dump 寄存器，定位真实 arg0 在 orig_a0。
+
+### v13 的验证方法 (2026-08-18)
+
+这个 bug 是概率性的，`echo hello`、fork+写栈、3000 次 fork+execve 都压不出来。**能稳定复现的
+配置是：父进程弄脏 256MB 私有匿名内存，子进程 fork 后遍历全部 16384 个页**——关键变量是
+子进程必须触发足量 COW 缺页，因为 t0/t1 是调用者保存寄存器，只有恰好持有活跃值时才致命。
+
+与其等 SIGBUS，不如直接测寄存器有没有被写坏：内联汇编把已知值放进 $t0/$t1，通过 $t0 做一次
+触发 COW 缺页的存储，再回读比对（见 `/tmp/forktest/cowprobe.c` 的思路）。
+
+A/B 对照结果（`runsc do`，各 100 轮）：
+
+| | 失败轮次 | 观察到的信号 |
+|---|---|---|
+| 修复前 | **12 / 100** | SIGSEGV ×11，SIGBUS ×1 |
+| 修复后 | **0 / 100** | — |
+
+按 12% 发生率算，修复后连过 100 轮的概率约 3×10⁻⁶。其中那次 SIGBUS 与最初 MariaDB 容器里
+`Bus error  sleep 1` 的签名一致；多数情况表现为 SIGSEGV——垃圾值落在合法但未映射的地址就是
+SIGSEGV，落在非规范地址才触发 LoongArch 的 ADE 例外变成 SIGBUS。这解释了为什么当初只是
+"偶尔"看到 Bus error。
+
+代价：fork 变成 O(堆大小)。192MB 堆的 JVM 上，fork 从 2ms 涨到约 76ms。

@@ -1,0 +1,20 @@
+Add LoongArch64 (linux/loong64) to the gazelle 0.47 platform tables.
+
+gazelle generates the BUILD files for external Go modules and silently drops
+source files whose build constraints name an architecture it does not know.
+That excluded the patched-in ztypes_loong64.go from com_github_creack_pty,
+leaving _C_int/_C_uint undefined and breaking the loong64 build.
+
+Kept as one patch per file: Bazel's built-in patch implementation
+mis-associates hunks across files when given a multi-file patch.
+
+--- a/rule/platform.go
++++ b/rule/platform.go
+@@ -73,6 +73,7 @@
+ 	{"linux", "amd64"},
+ 	{"linux", "arm"},
+ 	{"linux", "arm64"},
++	{"linux", "loong64"},
+ 	{"linux", "mips"},
+ 	{"linux", "mips64"},
+ 	{"linux", "mips64le"},

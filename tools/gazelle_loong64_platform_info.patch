@@ -1,0 +1,21 @@
+Add LoongArch64 (linux/loong64) to the gazelle 0.47 platform tables.
+
+gazelle generates the BUILD files for external Go modules and silently drops
+source files whose build constraints name an architecture it does not know.
+That excluded the patched-in ztypes_loong64.go from com_github_creack_pty,
+leaving _C_int/_C_uint undefined and breaking the loong64 build.
+
+Kept as one patch per file: Bazel's built-in patch implementation
+mis-associates hunks across files when given a multi-file patch.
+
+--- a/language/go/platform_info.go
++++ b/language/go/platform_info.go
+@@ -15,7 +15,7 @@
+ 
+ func IsKnownArch(arch string) bool {
+ 	switch arch {
+-	case "386", "amd64", "arm", "arm64", "mips", "mips64", "mips64le", "mipsle", "ppc64", "ppc64le", "riscv64", "s390x", "wasm":
++	case "386", "amd64", "arm", "arm64", "loong64", "mips", "mips64", "mips64le", "mipsle", "ppc64", "ppc64le", "riscv64", "s390x", "wasm":
+ 		return true
+ 	default:
+ 		return false

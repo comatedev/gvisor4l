@@ -45,3 +45,9 @@ build:x86_64 --platforms=@io_bazel_rules_go//go/toolchain:linux_amd64
 build:aarch64 --crosstool_top=@crosstool//:toolchains
 build:aarch64 --cpu=aarch64
 build:aarch64 --platforms=@io_bazel_rules_go//go/toolchain:linux_arm64
+
+# Set flags for loong64 (cross-compiled; upstream Bazel ships no loongarch64
+# binary, so the build host is x86_64). Unlike x86_64/aarch64 above this sets no
+# --crosstool_top: @crosstool is the coral crosstool, which has no loongarch64
+# support, and none is needed because //runsc:runsc is pure Go.
+build:loong64 --platforms=@io_bazel_rules_go//go/toolchain:linux_loong64
