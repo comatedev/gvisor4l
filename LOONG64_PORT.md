@@ -308,3 +308,64 @@ Linux 在 fork 时会不会继承 `mm->membarrier_state`，未能确认。若不
 - 那段代码是"屏障 + 重新检查"，而两次检查**都在 `b.mu` 锁内**。bucket 锁加上 stub 陷入内核的
   上下文切换本身可能已经提供了足够的顺序保证——屏障当初之所以奏效，也可能只是因为它引入了
   毫秒级延迟让写落地。若真如此，任何缩短该延迟的改动都在缩小安全边际。这是保守选择的另一个理由。
+
+## systrap 平台可行性调研 (2026-08-27)
+
+结论：**核心机制可行，但代价是构建体系。** 已在龙芯机器（内核 `6.6.0-32.22.v2505.ky11`）
+上用四个探针把每个环节实测过，程序留在 `~/systrap-probes/`（见其中的 `README`）。
+
+### 实测结论
+
+| 事实 | 值 | 影响 |
+|---|---|---|
+| `sizeof(struct sigaction)` | **24 字节，无 `sa_restorer`** | `linux.SigAction` 的 `Mask` 偏移在 loong64 上是错的，见下 |
+| `sa_mask` 偏移 | 16（不是 24） | 同上 |
+| `SA_RESTORER` | **被内核忽略**，`$ra` 恒为 vdso 的 `__vdso_rt_sigreturn` | systrap 的 restorer 方案不成立 |
+| 自发 `rt_sigreturn` | **可行**，且 vdso 已 munmap 时依然可行 | 这是出路 |
+| rt_sigframe 基址 | `== siginfo_t *`（handler 的 `$a1`）；`ucontext - siginfo == 128` | 不需要依赖结构体偏移 |
+| 缺页时 `sc_pc` | 指向**出错指令本身**（delta 0） | 修好映射后 sigreturn 原地重试 |
+| seccomp SIGSYS 时 `sc_pc` | 已**越过** `syscall 0`（delta +4） | 只需塞 `$a0`，不必自己推进 pc |
+| 系统调用号 | `sc_regs[11]`（`$a7`） | |
+| `sc_extcontext` | 本机首条即 `LASX_CTX_MAGIC` (0x41535801)，1056 字节 | 必须遍历整条链保存/还原 |
+
+对照实验（vdso 已 munmap）：普通返回的 handler → **SIGSEGV**；自发 `rt_sigreturn` 的 handler
+→ 正常返回。这正是 stub 进程的处境，因为
+`subprocess_linux.go` 会 munmap `stubROMapEnd` 到 `maximumUserAddress` 的全部区间，含 vdso。
+
+核心循环已整体验证：从 handler 改写 `uc_mcontext.__pc` 与 `sc_regs[]` 生效；seccomp
+`SECCOMP_RET_TRAP` → SIGSYS → 塞 `$a0` 伪造返回值 → 自发 sigreturn，应用侧拿到伪造值。
+FPU/LASX 上下文经"整块拷出 → 抹成 0xa5 → 拷回"的往返后，`$f0` 完好。
+
+写 systrap 的自发 sigreturn 时要注意一处 ABI 差异（**不是**本移植引入的）：gVisor 的信号帧是
+`{ucontext, siginfo}`（`$sp` 指向 ucontext），真内核是 `{siginfo, ucontext}`（`$sp` 指向
+siginfo，`uc - si = +128`）。upstream 的 arm64 也是如此（`signal_arm64.go` 同样先
+`info.CopyOut` 再 `uc.CopyOut`，`Sp = ucAddr`），sentry 自己的 `SignalRestore` 与之自洽，
+所以普通程序无感。探针 `02` 里的 `do_sigreturn(si)` 就是因为假设了内核布局而在 runsc 下 SIGBUS。
+
+调研过程中还发现了一个与 systrap 无关的既有 bug（guest 侧 sigaction 结构错位），已单独修复，
+见下一节。
+
+### 实现路线（未动工）
+
+按风险从高到低：
+
+1. **构建体系**（最大代价）。`tools/arch.bzl` 的 `arch_transition` 只有 amd64/arm64 两档，
+   而 `arch_genrule` 会给转换里的**每个**架构都编一遍 sighandler。加 loong64 意味着
+   `loong64_config()` 必须补回 `cpu` 和 `crosstool_top`，而 `@crosstool` 没有 loongarch64，
+   得自行注册 CC toolchain；14 处 `select_arch()` 全部要补分支；x86 构建机要装 LoongArch
+   C 交叉工具链。**`.bazelrc` 里"`//runsc:runsc` 是纯 Go 所以不需要 crosstool"从此不成立。**
+2. **`sysmsg/sighandler_loong64.c`**（参照 arm64 版 222 行）。难点是 `sc_extcontext` 链的
+   完整保存还原；写错不会崩，只会让浮点/向量结果静默出错。
+   `sysmsg/build.bzl` 的 `-DPAGE_SIZE` 只有 4096/65536 两档，要加 **16384**。
+3. **约 800 行 Go/汇编**，照抄 arm64 骨架：`filters` / `lib`（`cputicks` 用 `RDTIMED`）/
+   `stub` / `subprocess` / `syscall_thread` / `sysmsg_thread` / `systrap` / `systrap_unsafe` /
+   `sysmsg/sysmsg` / `usertrap/usertrap`（空实现）。
+
+有利因素：arm64 的 systrap 本身就是退化版（无 usertrap、无 syscall patching，`syshandler`
+只是一条陷阱指令），loong64 照抄即可；TLS 比 arm64 简单（`$tp` 就是 `sc_regs[2]`，在通用
+寄存器组里，不需要 `PTRACE_GETREGSET`）；`pkg/seccomp` 已就绪；`sigErrorToAccessType()`
+可先返回 `NoAccess`（ptrace 平台现在就是这么做的）。
+
+另：现有的占位 `pkg/sentry/platform/systrap/systrap_loong64.go` 是**截断的**，
+末尾停在一句注释上；它能过编译只是因为模板生成的代码恰好没被引用。
+
