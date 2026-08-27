@@ -369,3 +369,54 @@ siginfo，`uc - si = +128`）。upstream 的 arm64 也是如此（`signal_arm64.
 另：现有的占位 `pkg/sentry/platform/systrap/systrap_loong64.go` 是**截断的**，
 末尾停在一句注释上；它能过编译只是因为模板生成的代码恰好没被引用。
 
+## loong64 sigaction ABI 修复 (2026-08-27)
+
+做 systrap 调研时发现的既有 bug，已修复。**与 systrap 无关，影响的是当前的 ptrace 平台。**
+
+`pkg/abi/linux/SigAction` 是 32 字节、带 `Restorer`（x86/arm64 布局），而 loong64 内核的
+`struct sigaction` 是 **24 字节、无 `sa_restorer`、`sa_mask` 在偏移 16**——LoongArch 不定义
+`__ARCH_HAS_SA_RESTORER`，信号处理器一律经 vdso 的 `rt_sigreturn` 蹦床返回。sentry 却用
+32 字节布局 CopyIn/CopyOut guest 的 `rt_sigaction` 参数。
+
+三个后果（同一个静态二进制分别跑 runc 与 runsc 实测，探针在龙芯机 `~/sigabi/`）：
+
+| | 修复前 (runsc) | 修复后 (runsc) | 真内核 / runc |
+|---|---|---|---|
+| `sa_mask`@16（真实 ABI） | **被忽略** | 生效 | 生效 |
+| `sa_mask`@24 | 生效 | 被忽略 | 被忽略 |
+| `oldact` 写回字节数 | **32**（越界 8 字节） | 24 | 24 |
+| `SA_RESTORER` 位回读 | 保留 | 丢弃 | 丢弃 |
+| 置 `SA_RESTORER` 时 `$ra` | **0x0**（一返回就崩） | vdso 地址 | vdso 地址 |
+
+1. **guest 的 `sa_mask` 被完全忽略。** 任何用非空 `sa_mask` 的程序（HotSpot、MariaDB 都算），
+   handler 执行期间本该阻塞的信号不会被阻塞。不崩，只是行为不对。
+2. **`sigaction(sig, act, oldact)` 往 guest 的 24 字节缓冲区写 32 字节。** glibc 的
+   `__libc_sigaction` 把 `koact` 放在栈上，越界的 8 字节覆盖相邻栈空间。
+3. **guest 若置了 `SA_RESTORER` 位，`$ra` 会是 0。** `kernel/task_signals.go:277` 只在该位
+   未置时才用 `mm.VDSOSigReturn()` 兜底，而置位时 `Restorer` 读到的是偏移 16 上的 `sa_mask`。
+   真内核会直接丢弃这个位（实测确认），所以正确的模拟是在 copy-in 时抹掉它。
+
+改法：`SigAction` 本身不动（`Restorer` 字段被 sentry 内部和 amd64/arm64 大量引用），只在
+**guest ABI 边界**上转换。新增 `CopyInABI` / `CopyOutABI`：amd64/arm64 直接转发；loong64 走
+一个 24 字节的 `SigActionABI`，并在 copy-in 时清掉 `SA_RESTORER`。调用点只有
+`syscalls/linux/sys_signal.go` 的 `RtSigaction` 和 `strace/signal.go`。
+
+### 一个 Bazel 坑
+
+第一版把 amd64/arm64 的转发放在一个 `signal_restorer.go` 里，用 `//go:build amd64 || arm64`。
+结果 **loong64 下整个 `pkg/abi/linux` 的 marshal 方法全部消失**，报错是几十个
+`missing method CopyIn` / `SizeBytes undefined`。
+
+原因：`tools/defs.bzl:calculate_sets()` 纯按**文件名后缀**给源文件分桶，`signal_restorer.go`
+没有架构后缀就落进通用桶，go_marshal 于是把它的 `//go:build amd64 || arm64` 聚合到了整个通用
+autogen 文件的头部——loong64 下该文件被整体排除。生成文件开头那段注释正是在警告这件事。
+
+**结论：`pkg/abi/linux` 里任何带架构约束的文件都必须用 `_amd64.go` / `_arm64.go` /
+`_loong64.go` 后缀命名，不能只靠 `//go:build`。** 拆成两个文件即可。
+
+### 验证
+
+- 三项 ABI 行为全部与真内核对齐，`oldact` 原始字节逐字节相同。
+- JStress 全套新旧二进制同机 A/B：均为 `futex/park-unpark` 一项失败、耗时 155s 上下，
+  无差异。该失败是既有的 futex 慢速问题（见《② futex 屏障》），`JFutex` 判定
+  `RESULT PASS (no lost wakeups)`、`lost_wakeups=0`、15.41ms/hop，属超时而非丢唤醒。

@@ -131,7 +131,7 @@ func sigAction(t *kernel.Task, addr hostarch.Addr) string {
 	}
 
 	var sa linux.SigAction
-	if _, err := sa.CopyIn(t, addr); err != nil {
+	if _, err := sa.CopyInABI(t, addr); err != nil {
 		return fmt.Sprintf("%#x (error copying sigaction: %v)", addr, err)
 	}
 

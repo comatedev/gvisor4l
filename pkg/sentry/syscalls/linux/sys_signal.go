@@ -217,7 +217,7 @@ func RtSigaction(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uin
 	var newactptr *linux.SigAction
 	if newactarg != 0 {
 		var newact linux.SigAction
-		if _, err := newact.CopyIn(t, newactarg); err != nil {
+		if _, err := newact.CopyInABI(t, newactarg); err != nil {
 			return 0, nil, err
 		}
 		newactptr = &newact
@@ -227,7 +227,7 @@ func RtSigaction(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uin
 		return 0, nil, err
 	}
 	if oldactarg != 0 {
-		if _, err := oldact.CopyOut(t, oldactarg); err != nil {
+		if _, err := oldact.CopyOutABI(t, oldactarg); err != nil {
 			return 0, nil, err
 		}
 	}
