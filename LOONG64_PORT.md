@@ -420,3 +420,64 @@ autogen 文件的头部——loong64 下该文件被整体排除。生成文件�
 - JStress 全套新旧二进制同机 A/B：均为 `futex/park-unpark` 一项失败、耗时 155s 上下，
   无差异。该失败是既有的 futex 慢速问题（见《② futex 屏障》），`JFutex` 判定
   `RESULT PASS (no lost wakeups)`、`lost_wakeups=0`、15.41ms/hop，属超时而非丢唤醒。
+
+## 未结：MariaDB 关闭期偶发 glibc 断言 (2026-08-27)
+
+**一次观测，未能归因，未能排除。** 记录在此以免下次重新摸索。
+
+bootstrap 版 mariadbd 关闭时，`ib_tpool_worker` 线程在 glibc 的线程退出路径上崩溃：
+
+```
+Fatal glibc error: allocatestack.c:194 (advise_stack_range): assertion failed: freesize < size
+```
+
+容器退出码 1，`mariadb-install-db` 报 "Installation of system tables failed"。
+
+`advise_stack_range()` 在线程退出时把栈的未使用部分 `madvise(MADV_DONTNEED)` 还给内核，
+`freesize = (sp - pd->stackblock) & ~(pagesize-1)`。断言失败意味着退出时的 `$sp` 落在
+`pd->stackblock` 之外。
+
+### 已排除的两条
+
+1. **不是 sigaction 修复引起的**（就现有证据）。该修复唯一的行为变化是"handler 执行期间
+   应用 `sa_mask`"，而 strace 日志显示**崩溃前后该进程没有任何信号投递**——15:11:41 的信号
+   事件只有 task 1 的 SIGCHLD 和拆除阶段的 SIGKILL，全部在崩溃（`.144`）之后。日志里那条
+   `rt_sigaction(SIGABRT, SIG_DFL)` 是 `abort()` 自己在重置 disposition。mariadbd 也从未
+   调用 `sigaltstack`。
+2. **不是 `io_destroy` 打断 `io_getevents`。** 崩溃前主线程 `io_destroy()` 使 worker 的
+   `io_getevents()` 返回 EINVAL，看着可疑，但 `/tmp/rlog` 里 **76/76 次运行都有这个
+   EINVAL**，是 MariaDB 正常关闭行为。
+
+### 统计
+
+`/tmp/rlog` 覆盖 2026-08-09 至 08-27，76 次跑到关闭路径的 mariadbd（全部开着 `--strace`）：
+
+| | 失败 / 总数 |
+|---|---|
+| 含 sigaction 修复 | 1 / 31 |
+| 修复之前 | 0 / 45 |
+
+Fisher 精确检验 p≈0.41。另做过 30 轮逐次交替切换二进制的对照（消除机器状态漂移），两边 0 失败。
+
+### 推不下去的地方
+
+从 `mprotect(0x7ffec0830000, 0x800000, PROT_READ|PROT_WRITE)` 可反推线程 92 的
+`stackblock = 0x7ffec082c000`、`stackblock_size = 0x804000`（含 16K guard），而崩溃时观察到
+的栈地址 `0x7ffec102e3e8` **在范围内**。所以要么 `pd` 里的 stackblock 字段被写坏，要么线程
+当时真的在另一个栈上——两者都需要 glibc 的内部状态才能判定，strace 日志给不出。
+
+### 运维发现：`/tmp` 是内存
+
+`/etc/docker/daemon.json` 给 runsc 配了 `--debug --strace --debug-log=/tmp/rlog/`，
+每次 boot 日志约 **15MB**。而 `/tmp` 是 **3.7G 的 tmpfs**，即占用物理内存，机器总共只有
+7.3Gi。调查时 `/tmp/rlog` 已积到 **3.0G / 82%**。
+
+也就是说**这台机器长期有 3GB 内存被 strace 日志占着**，且几十次容器运行就会把 `/tmp` 撑爆。
+这未必是本 bug 的成因，但它是一个真实的、会影响一切偶发问题复现条件的环境因素。跑批量实验
+前务必先清理或关掉 `--strace`。
+
+### 进行中
+
+`~/soak/soak.sh` 在龙芯机后台跑 250×2 轮逐次交替的 A/B（结果见 `~/soak/results.txt`，
+失败的完整日志落在 `~/soak/failures/`）。脚本会边跑边删自己产生的成功日志，
+并在 `/tmp` 剩余不足 400M 时自动停止。
