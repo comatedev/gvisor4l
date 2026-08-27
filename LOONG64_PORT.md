@@ -421,7 +421,96 @@ autogen 文件的头部——loong64 下该文件被整体排除。生成文件�
   无差异。该失败是既有的 futex 慢速问题（见《② futex 屏障》），`JFutex` 判定
   `RESULT PASS (no lost wakeups)`、`lost_wakeups=0`、15.41ms/hop，属超时而非丢唤醒。
 
-## 未结：MariaDB 关闭期偶发 glibc 断言 (2026-08-27)
+## 未结：容器内偶发的 guest 内存破坏 (2026-08-27)
+
+**这不是 MariaDB 的 bug，也不是 sigaction 修复引入的。是 guest 内存被静默写坏。**
+
+### 与 sigaction 修复无关（已结案）
+
+逐次交替切换二进制的 A/B soak，435 轮 ×2：
+
+```
+新（含 sigaction 修复）: PASS=430 FAIL=8
+旧                    : PASS=429 FAIL=8
+```
+
+**8 比 8。** 加上此前 250×2 全过的一轮，该修复可以排除。
+
+### 两种故障签名，两个二进制都有
+
+| 签名 | 次数 | 含义 |
+|---|---|---|
+| `advise_stack_range: freesize < size` | 11 | glibc 线程退出时 `$sp` 不在自己的 stackblock 里 |
+| `*** stack smashing detected ***` | 5 | 栈金丝雀被覆写 |
+
+其中一次受害者是 **`mkdir`**。strace 显示得很清楚：
+
+```
+[1:1] E clone(CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|0x11, ...)
+[2:2] E set_robust_list(...)
+[2:2] E rt_sigprocmask(SIG_SETMASK, [SIGINT SIGTERM SIGCHLD], ...)
+[1:1] X clone(...) = 2   (8.862042ms)      <- 正常 fork 约 100µs
+[2:2] E writev(2, "*** ", "stack smashing detected", ...)
+```
+
+bash fork 出子进程，子进程做完两个系统调用、**还没走到 `execve`**，金丝雀就已经坏了。
+两种签名指向同一件事：**fork 后子进程的内存被写坏**。
+
+### 已排除：寄存器污染（原始 SIGBUS 那条路径）
+
+原始 bug 的机理是内核 TLB 例外路径不恢复 t0/t1，sentry 用垃圾基址重跑 store。
+垃圾地址非规范时是 SIGBUS，规范且已映射时就是**静默写错地址**——形态上完全吻合。
+但实测不成立，四个探针合计约 **250 万次**，全部零污染：
+
+| 探针 | 路径 | 规模 | 结果 |
+|---|---|---|---|
+| `cowprobe` | fork COW 缺页 | 163 万次（原始复现规模 256MB/16384 页，`-m 1g`） | t0=0 t1=0 |
+| `fp` A | 栈自动增长 | 宿主 + runsc | 0 |
+| `fp` B | `MADV_DONTNEED` 重缺页 | 宿主 + runsc | 0 |
+| `fp` C | 匿名页首次触碰 | 宿主 + runsc | 0 |
+| `fp2` D | SIGSEGV 投递 + 修复 + 重试 | 宿主 + runsc，20 万次真实投递 | 0 |
+
+探针在龙芯机 `~/faultprobe/`（`fp.c`、`fp2.c`）和 `/tmp/forktest/cowprobe.c`。
+**`f03b376e3` 的 COW 修复守得很稳**；文档里此前点名的另外两条懒缺页路径也没问题。
+
+### 未决：是不是 gVisor 的问题
+
+runsc vs runc 逐次交替对照，因 `/tmp` 触发保护阈值只跑到 48 轮就停了：
+
+```
+runsc: PASS=47 FAIL=1     runc: PASS=48 FAIL=0
+```
+
+**样本远不够。** 需要注意：即使 runc 最终全过，也**不能**直接断定 gVisor 有 bug——
+这台机器是旧世界固件 + 新世界系统，正是当初 SIGBUS 唯一发作的组合；gVisor 的 sentry
+每单位 guest 工作要做的缺页/mmap/madvise 远多于 runc，可能只是把某条有缺陷的路径踩得更频繁。
+
+### 一条强线索：时间累积 + 内存压力
+
+- 第一轮 250×2（15:41–17:31）：**0 失败**
+- 第二轮前 115 轮（20:19–21:10）：**0 失败**
+- 21:10–23:22 之间：**16 次失败**
+
+有东西是累积的。失败那次的 fork 耗时 **8.9ms**（正常 ~100µs）。机器 `MemAvailable` 长期
+只有约 1.4Gi（总 7.3Gi），其中 **2.6–2.8Gi 是 `/tmp` 这个 tmpfs**——`daemon.json` 给 runsc
+配了 `--debug --strace --debug-log=/tmp/rlog/`，每次 boot 日志约 15MB，已积到 3.0G。
+
+**把 `/tmp/rlog` 挪到磁盘可释放约 3GB 物理内存**，既是继续跑 soak 的前提，
+本身也是对"内存压力是触发条件"这一假设的直接检验：若挪走后故障消失，假设成立。
+
+### 数据位置（龙芯机）
+
+- `~/soak/results-250.txt`、`~/soak/results.txt`：new/old A/B 原始数据
+- `~/soak/failures/`：16 次失败的完整 rlog + 容器日志
+- `~/soak/results-runc.txt`、`~/soak/failures-runc/`：runsc vs runc 对照
+- `~/faultprobe/`：四个寄存器污染探针
+
+## 附：该故障的首次观测记录 (2026-08-27)
+
+> 下节是最初只有一次观测时的分析，结论已被上一节取代（当时怀疑与 sigaction 修复有关，
+> 后经 435×2 轮 A/B 证明无关）。保留以记录排查过程。
+
+### 首次观测
 
 **一次观测，未能归因，未能排除。** 记录在此以免下次重新摸索。
 
