@@ -928,3 +928,71 @@ guest 侧用 `userfaultfd`/`mprotect` 把 `pd` 所在页设为只读来捕获写
 
 **现象仍在，机制未定。** 但归因确凿、复现器可用（40 秒一轮、约 1/6 命中）、损坏点精确到
 `pd+1168` 单字段、写入时刻锁定在 clone 期间、写入者确定不是 sentry。
+
+## 确凿缺陷：LSX/LASX 向量寄存器不跨上下文切换保存 (2026-08-29)
+
+**这是一个独立的、可稳定复现的严重缺陷，与前面那个未破的 `pd` 损坏是两回事（关联未证实）。**
+
+线索来自上游三个 issue：#12741（systrap 在 Intel 上的静默内存损坏）+ #12994（其修复：
+AMX 扩展状态范围算错导致多写）+ #13542（ARM64 的 PAC 密钥未随 checkpoint 保存）。
+三者主题一致：**架构特有的扩展状态没被正确处理**。LoongArch 上对应的就是 LSX/LASX——
+而本移植明确不保存它们（`fpu_loong64.go`、`signal_loong64.go`、`ptrace_loong64.go`、
+`features_loong64.go` 均有注释说明）。
+
+### 实测
+
+`~/bss/veccheck.c`：给 `$xr0`–`$xr7` 灌入可辨识值，执行 `getpid` + `sched_yield`
+强制往返 sentry 与重新调度，再校验。
+
+| | 迭代次数 | 失败 |
+|---|---|---|
+| runc | **9605 万** | 0 |
+| runsc | **128** | 是 |
+
+失败形态是决定性的：
+
+```
+$xr5 = 0000000000000066 ffffffffffffffff ffffffffffffffff ffffffffffffffff
+       ^^^^ lane0 正确   ^^^^^^^^^^^^^^^^ 高 192 位全丢
+```
+
+**低 64 位（传统 FPU 的 `$f` 寄存器）保住了，高 192 位没有。** 与
+`ptrace_loong64.go` 里只走 `NT_PRFPREG` 的实现完全对应——内核另有
+`NT_LOONGARCH_LSX` / `NT_LOONGARCH_LASX` 两个 regset，gVisor 没有使用。
+
+### 危险之处：`cpucfg` 没有被屏蔽
+
+```
+             AT_HWCAP            cpucfg(2) 报告的真实硬件
+runc         LSX=1 LASX=1        LSX=1 LASX=1
+runsc        LSX=0 LASX=0        LSX=1 LASX=1
+```
+
+gVisor 在 HWCAP 里把 LSX/LASX 屏蔽掉了，所以 glibc 的 ifunc 会选标量实现
+（实测容器内 memcpy 1MB 后向量寄存器完好，走的是标量路径）。**但 `cpucfg` 是非特权指令，
+gVisor 没有拦截它，guest 直接执行看到的是真实硬件能力。**
+
+于是任何**不查 HWCAP、而用 `cpucfg` 自行探测**的代码都会使用向量指令，
+然后在一个不保存这些寄存器的运行时上静默出错。这类代码包括：
+
+- **JIT**：HotSpot 在 LoongArch 上正是用 `cpucfg` 探测 CPU 特性的。这很可能是当初
+  "被 Java 折腾惨了"的一部分原因。
+- 用 `-mlsx` / `-mlasx` 编译的第三方库（本机 gcc 默认就支持这两个选项）
+- 手写向量汇编
+
+### 两条可选的修法
+
+1. **拦截 `cpucfg`**，把 LSX/LASX 位清掉，让 guest 的探测与 HWCAP 一致。
+   代价小，但只是"让 guest 别用"，用了仍然坏。
+2. **真正保存/恢复向量状态**：在 ptrace 平台用 `NT_LOONGARCH_LSX`/`NT_LOONGARCH_LASX`
+   两个 regset，并把扩展上下文纳入信号帧（`signal_loong64.go` 现在写死
+   `FpuInfo: SctxInfo{Magic: _FPU_CTX_MAGIC, Size: 16+272}`，而真实硬件的第一条记录
+   实测是 `LASX_CTX_MAGIC`、1056 字节）。代价大但根治。
+
+**在做到 2 之前，1 是必须的**——否则 guest 会以为自己能用向量指令而实际上不能。
+
+### 与 `pd` 损坏的关系：未证实
+
+被测探测器 `thrbss` 本身有 0 条向量指令，容器内 libc 的 memcpy 也走标量路径，
+所以那个 `pd->stackblock` 常量损坏**不能**直接归因到本缺陷。两者都真实存在，
+但因果关系没有证据，不硬凑。
