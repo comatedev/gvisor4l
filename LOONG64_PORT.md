@@ -1203,3 +1203,61 @@ runsc: no LSX/LASX record found in sc_extcontext
 约 800 行 Go/汇编、以及 SA_RESTORER 不可用需改成自发 `rt_sigreturn`（已验证可行）。
 
 在 systrap 做出来之前，ptrace 平台上**向量状态问题无解**（连规避手段都不存在，见上一节）。
+
+## systrap 移植：sysmsg blob 已能为 loong64 构建 (2026-08-30)
+
+第一个里程碑。之前调研判定"构建体系是最大代价"，实际踩到的坑与预期基本吻合。
+
+### 需要的东西
+
+**C 交叉工具链**：Ubuntu 26.04 源里有 `gcc-loongarch64-linux-gnu` 15.2.0 +
+`binutils-loongarch64-linux-gnu` 2.46，直接装。
+
+**Bazel CC toolchain**：`tools/cc_toolchain_loong64/`，一个最小的
+`cc_toolchain_config`（只配 tool_paths，无 sysroot、无 libc、不做动态链接——blob 是
+freestanding 的），在 `MODULE.bazel` 里 `register_toolchains`。
+`@platforms//cpu:loongarch64` 此前移植时已通过补丁加入，直接可用。
+
+### 踩到的坑
+
+| 问题 | 解法 |
+|---|---|
+| `-mgeneral-regs-only` LoongArch 不支持 | 见下，改用 `-mno-lsx -mno-lasx` + 构建期断言 |
+| `-DPAGE_SIZE` 只有 4K/64K 两档 | 加 16384 分支 |
+| `rdtsc()` / `spinloop()` 无 loong64 分支 | `rdtime.d` / `dbar 0` |
+| `sizeof(thread_context) > 4096` | `MAX_FPSTATE_LEN` 按架构调小 |
+
+**`-mgeneral-regs-only` 这条值得说清楚。** LoongArch 没有这个选项，而最接近的等价物都会
+**切换 ABI**：`-msoft-float` 和 `-mfpu=none` 都选 `lp64s`，而硬浮点交叉 libc 没有对应头文件
+（`gnu/stubs-lp64s.h` 不存在）；`-mabi=lp64d -mfpu=none` 则被直接拒绝为自相矛盾。
+
+但它在这里没有名字暗示的那么关键：**内核在进入信号处理器时已把完整的 FP/向量状态存进
+信号帧、在 `rt_sigreturn` 时恢复**，所以处理器运行期间 guest 的寄存器在内存里，处理器碰
+FP 寄存器不会丢它们。真正不能出现的是向量指令，故用 `-mno-lsx -mno-lasx`。
+
+既然靠的是推理而不是编译器保证，就**在构建期断言结果**：编完之后 objdump 该目标文件，
+出现任何向量或浮点指令即构建失败。正则已单独验证过（对含 `vld`/`xvst`/`fmul`/`fst` 的
+对象文件命中，对纯整数代码不误报）。
+
+`MAX_FPSTATE_LEN` 那条：3584 是按 amd64 的 xsave 定的，而 loong64 的
+`user_regs_struct` 有 360 字节（arm64 只有 272），会把 `thread_context` 撑过 4096。
+loong64 实测整条扩展上下文链只有 1072 字节（LASX 1056 + 16 字节终止记录），故取 2048。
+
+### 新增的三个文件
+
+- **`sigrestorer_loong64.S`**：`__export_restore_rt`。**不经 SA_RESTORER**——LoongArch
+  没有该字段，内核把 `$ra` 指向 vdso 的 rt_sigreturn，而 stub 已经把 vdso munmap 掉了。
+  处理器改为**尾调用**它，并传入 rt_sigframe 基址（即内核放在 `$a1` 的 siginfo 指针）。
+  这条路在可行性调研里已实测：vdso 消失后普通返回必 SIGSEGV，自发 `rt_sigreturn` 正常。
+- **`syshandler_loong64.S`**：与 arm64 一样只是一条陷阱指令，syscall patching 是 amd64 专属。
+- **`sighandler_loong64.c`**（224 行）：核心。与 arm64 版的关键差异是 FP 状态的搬运方式——
+  arm64 拷 `fpsimd_context` 一个定长结构，loong64 则**整条 `sc_extcontext` 记录链原样搬运**
+  （遍历 sctx_info 直到 magic 为 0）。这正是 systrap 能保住向量状态的原因。
+
+### 产物
+
+```
+raw binary: 4032 字节
+__export_restore_rt / __export_sighandler / __export_start / ... 全部导出
+向量指令: 0    浮点指令: 0
+```

@@ -22,6 +22,10 @@ bazel_dep(name = "grpc", version = "1.76.0", repo_name = "com_github_grpc_grpc")
 bazel_dep(name = "protobuf", version = "33.2", repo_name = "com_google_protobuf")
 bazel_dep(name = "platforms", version = "1.0.0")
 
+# A C cross-toolchain for loongarch64, needed by the systrap sysmsg blob. Only
+# the blob needs one -- //runsc:runsc itself is pure Go.
+register_toolchains("//tools/cc_toolchain_loong64:toolchain")
+
 single_version_override(
     module_name = "platforms",
     patch_strip = 1,

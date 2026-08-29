@@ -27,7 +27,18 @@
 // LINT.ThenChange(../../../arch/fpu/fpu_amd64.go)
 
 // LINT.IfChange
+#if defined(__loongarch64)
+// 3584 is sized for amd64's xsave area. LoongArch carries its FP and vector
+// state as a chain of sctx_info records, measured at 1072 bytes on a 3A5000
+// (LASX 1056 plus the 16-byte terminator), so 2048 is ample.
+//
+// It also has to be smaller: thread_context must fit in
+// ALLOCATED_SIZEOF_THREAD_CONTEXT_STRUCT, and loong64's user_regs_struct is
+// 360 bytes against arm64's 272, which pushes the struct over 4096 at 3584.
+#define MAX_FPSTATE_LEN 2048
+#else
 #define MAX_FPSTATE_LEN 3584
+#endif
 // Note: To be explicit, 2^12 = 4096; if ALLOCATED_SIZEOF_THREAD_CONTEXT_STRUCT
 //       is changed, make sure to change the code that relies on the bitshift.
 #define ALLOCATED_SIZEOF_THREAD_CONTEXT_STRUCT 4096

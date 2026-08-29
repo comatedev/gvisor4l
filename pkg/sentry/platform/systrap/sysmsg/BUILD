@@ -20,6 +20,7 @@ cc_pie_obj(
             "sysmsg_offsets_amd64.h",
         ],
         arm64 = ["sighandler_arm64.c"],
+        loong64 = ["sighandler_loong64.c"],
     ) + [
         "atomic.h",
         "sysmsg.h",
@@ -44,6 +45,7 @@ cc_pie_obj(
     srcs = select_arch(
         amd64 = ["sigrestorer_amd64.S"],
         arm64 = ["sigrestorer_arm64.S"],
+        loong64 = ["sigrestorer_loong64.S"],
     ),
     outs = ["sysrestorer.o"],
 )
@@ -56,6 +58,7 @@ cc_pie_obj(
             "sysmsg_offsets_amd64.h",
         ],
         arm64 = ["syshandler_arm64.S"],
+        loong64 = ["syshandler_loong64.S"],
     ) + [
         "sysmsg_offsets.h",
     ],

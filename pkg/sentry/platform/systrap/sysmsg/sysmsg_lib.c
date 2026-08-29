@@ -84,6 +84,19 @@ static __inline__ unsigned long rdtsc(void) {
 }
 
 static __inline__ void spinloop(void) { asm volatile("yield" : : : "memory"); }
+#elif defined(__loongarch64)
+static __inline__ unsigned long rdtsc(void) {
+  // The stable counter, the same source the loong64 vdso reads for
+  // clock_gettime. $zero as rd2 discards the counter id.
+  unsigned long val;
+  asm volatile("rdtime.d %0, $zero" : "=r"(val));
+  return val;
+}
+
+// LoongArch has no pause or yield hint available to user mode -- idle is
+// privileged -- so a full barrier is the closest thing that both costs
+// something and orders the loads the caller is spinning on.
+static __inline__ void spinloop(void) { asm volatile("dbar 0" : : : "memory"); }
 #endif
 
 void *__export_context_region;
