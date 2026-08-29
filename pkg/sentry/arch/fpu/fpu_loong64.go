@@ -23,10 +23,45 @@ const (
 	// arch/loongarch/include/uapi/asm/sigcontext.h.
 	loongFPUMagic = 0x46505501
 
-	// loongFPUStateSize is the byte size of the per-task FPU save area we
-	// allocate, matching `struct user_fp_state` (fpr[32] + fcc + fcsr)
-	// rounded up to 8-byte alignment. LSX/LASX/LBT contexts are NOT saved.
-	loongFPUStateSize = 0x110 // 272 bytes
+	// The per-task save area is a concatenation of the ptrace regsets that
+	// together make up a thread's floating-point and vector state. NT_PRFPREG
+	// only covers the low 64 bits of each vector register, so saving it alone
+	// silently drops the upper 192 bits of every LASX register across a
+	// context switch.
+	//
+	// Sizes are the kernel's, confirmed by PTRACE_GETREGSET on a 3A5000:
+	//
+	//	NT_PRFPREG         272   struct user_fp_state   fpr[32], fcc, fcsr
+	//	NT_LOONGARCH_LSX   512   struct user_lsx_state  32 x 128 bits
+	//	NT_LOONGARCH_LASX 1024   struct user_lasx_state 32 x 256 bits
+	//	NT_LOONGARCH_LBT    40   struct user_lbt_state  scr[4], eflags, ftop
+	//
+	// LSX and LASX are the same register file at different widths, so only
+	// the wider one the CPU supports is transferred; LoongVecSize reserves
+	// room for the larger.
+	LoongFPRegsOffset = 0
+	LoongFPRegsSize   = 272
+
+	// LSX and LASX are the same registers at different widths, but their
+	// regsets use different layouts (32x128 vs 32x256), so they cannot share
+	// a buffer. Both are carried and both are optional; on restore LSX is
+	// applied first and LASX, where the CPU has it, overwrites at full width.
+	//
+	// Choosing between them from a feature bit does not work: the sentry's
+	// FeatureSet is the guest-visible one and AllowedHWCap1 filters both out,
+	// so HasFeature(LASX) is false even on hardware that has it. Attempt each
+	// instead and let the kernel reject what it does not implement.
+	LoongLSXOffset = LoongFPRegsOffset + LoongFPRegsSize
+	LoongLSXSize   = 512
+
+	LoongLASXOffset = LoongLSXOffset + LoongLSXSize
+	LoongLASXSize   = 1024
+
+	LoongLBTOffset = LoongLASXOffset + LoongLASXSize
+	LoongLBTSize   = 40
+
+	// loongFPUStateSize is the total, rounded up to 16-byte alignment.
+	loongFPUStateSize = (LoongLBTOffset + LoongLBTSize + 15) &^ 15 // 1344
 )
 
 // initLoongFPState resets the state to the canonical "clean" values.

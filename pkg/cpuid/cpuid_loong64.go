@@ -39,20 +39,16 @@ func (fs FeatureSet) CPUModel() string {
 }
 
 // ExtendedStateSize returns the size and alignment of the extended FPU state
-// area. gVisor on LoongArch64 saves only the base 32x64-bit FP registers plus
-// FCC / FCSR; LSX (128b) and LASX (256b) state is not saved.
+// area. It covers the base FP file (NT_PRFPREG) plus the vector and binary
+// translation register files, which live in their own ptrace regsets; see
+// fpu.LoongFPRegsOffset and friends for the layout.
 //
-// Layout matches the kernel's struct user_fp_state:
-//
-//	struct user_fp_state {
-//	    __u64 fpr[32];          // 32 * 8 = 256 bytes
-//	    __u64 fcc;              // 8 bytes
-//	    __u32 fcsr;             // 4 bytes
-//	};
-//
-// Rounded up to 8-byte alignment.
+// Saving only NT_PRFPREG is not enough: it holds the low 64 bits of each
+// vector register, so the upper 192 bits of every LASX register are dropped
+// across a context switch. Guests reach the vector unit whether or not HWCAP
+// advertises it, because cpucfg reports the real hardware.
 func (fs FeatureSet) ExtendedStateSize() (size, align uint) {
-	return 272, 8
+	return 1856, 16
 }
 
 // HasFeature checks for the presence of a feature.

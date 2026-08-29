@@ -22,12 +22,14 @@ import (
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
 )
 
 // archContext is architecture-specific context.
 type archContext struct {
-	// fpLen is the size of the floating-point state we save/restore.
+	// fpLen is the size of the whole floating-point save area.
 	fpLen int
+
 }
 
 // init initializes the archContext.
@@ -42,11 +44,30 @@ func (a *archContext) floatingPointLength() uint64 {
 	return uint64(a.fpLen)
 }
 
-// floatingPointRegSet returns the ptrace regset note used to read/write FP.
-// LoongArch exposes the basic FPU via NT_PRFPREG (LSX/LASX have their own
-// notes that we do NOT use).
+// floatingPointRegSet returns the ptrace regset note used to read/write the
+// base FP register file.
 func (a *archContext) floatingPointRegSet() uintptr {
 	return linux.NT_PRFPREG
+}
+
+// fpRegSets returns the regsets making up the saved FP state.
+//
+// NT_PRFPREG holds only the low 64 bits of each vector register, so on its own
+// it drops the upper 192 bits of every LASX register whenever a thread is
+// descheduled. A guest reaches the vector unit whether or not HWCAP advertises
+// it, since cpucfg reports the real hardware, so the state has to be carried
+// even though AllowedHWCap1 filters LSX and LASX out.
+//
+// The vector and LBT regsets are optional: a CPU or kernel without them makes
+// PTRACE_GETREGSET fail, which is not an error for us.
+func (a *archContext) fpRegSets() []fpRegSetSpec {
+	return []fpRegSetSpec{
+		{note: linux.NT_PRFPREG, offset: fpu.LoongFPRegsOffset, length: fpu.LoongFPRegsSize},
+		// LASX carries the full 256 bits and supersedes LSX; transferring
+		// both regressed the upper lanes, so carry only the wider one.
+		{note: linux.NT_LOONGARCH_LASX, offset: fpu.LoongLASXOffset, length: fpu.LoongLASXSize, optional: true},
+		{note: linux.NT_LOONGARCH_LBT, offset: fpu.LoongLBTOffset, length: fpu.LoongLBTSize, optional: true},
+	}
 }
 
 // stackPointer returns the user-mode stack pointer. On LoongArch SP is just

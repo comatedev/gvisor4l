@@ -44,6 +44,15 @@ func (a *archContext) floatingPointRegSet() uintptr {
 	return linux.NT_PRFPREG
 }
 
+// fpRegSets returns the regsets making up the saved FP state. One regset
+// covers all of it here.
+func (a *archContext) fpRegSets() []fpRegSetSpec {
+	return []fpRegSetSpec{{
+		note:   a.floatingPointRegSet(),
+		length: a.fpLen,
+	}}
+}
+
 func stackPointer(r *arch.Registers) uintptr {
 	return uintptr(r.Sp)
 }

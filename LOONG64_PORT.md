@@ -996,3 +996,51 @@ gVisor 没有拦截它，guest 直接执行看到的是真实硬件能力。**
 被测探测器 `thrbss` 本身有 0 条向量指令，容器内 libc 的 memcpy 也走标量路径，
 所以那个 `pd->stackblock` 常量损坏**不能**直接归因到本缺陷。两者都真实存在，
 但因果关系没有证据，不硬凑。
+
+### 修法 2 的尝试：基础设施就位，但没修好
+
+按"真正保存/恢复向量状态"的路子改了一版，**没有成功**，如实记录以免下一个人重走。
+
+改了什么（在 `47be24383..` 之后的工作区，未合入生产）：
+
+- `pkg/abi/linux/elf.go` 加 `NT_LOONGARCH_LSX/LASX/LBT` 常量
+- `fpu_loong64.go` 把每任务 FP 保存区从 272 字节扩到 1856，按 regset 分段布局
+- `cpuid_loong64.go` 的 `ExtendedStateSize` 相应改为 1856/16
+- `ptrace_unsafe.go` 把 FP 传输抽象成 regset 列表（`fpRegSetSpec`），各架构给自己的组成；
+  amd64/arm64 保持单个 regset，行为不变
+
+结果：
+
+| 版本 | veccheck 表现 |
+|---|---|
+| 修复前 | 只有 lane0 保留（128 次内失败）|
+| 传 LSX（按 feature bit 选） | lane0+1 保留（12–287 次失败）|
+| 传 LSX + LASX | **退回只有 lane0** |
+| 只传 LASX | 只有 lane0（偶尔 lane1）|
+
+**关键：加了 errno 日志后，四个 regset 的传输全部成功，零失败。** 传输是通的，
+缓冲区大小和偏移都对（`fpu.NewState()` 确实分配 1856 字节，`FloatingPointData()`
+返回的就是它），顺序也验证过是对的——
+
+用户态直接测两种恢复顺序（`~/bss/ordertest.c`）：
+
+```
+PRFPREG,LSX,LASX   xr0: aaaa0000 aaaa0001 aaaa0002 aaaa0003   全宽保留
+LASX,LSX,PRFPREG   xr0: 0000005a 0000005a aaaa0002 aaaa0003   高位丢失
+```
+
+gVisor 用的正是前者。而 `~/bss/regsettest.c` 也证明这三个 regset 在宿主上
+GET/SET 都完全正常。
+
+**所以 ptrace 的存取不是 guest 向量状态的唯一去处，还有别的地方在丢它，我没找到。**
+丢失时填充值恒为 `0xffffffffffffffff`，与 LoongArch 内核 `init_fp_ctx()` 的
+`memset(fpr, ~0, ...)` 一致——即某处触发了"该任务尚未用过 FP"的初始化路径。
+
+下一个人可以从这里接着查：
+- `switchToApp` 之外是否还有进入 guest 的路径没有恢复 FP
+- 内核的 `TIF_USEDSIMD` / `tsk_used_math` 标志在 PTRACE_SETREGSET 序列中如何变化
+- 信号投递路径（`signal_loong64.go` 的 `SignalSetup` 会 `c.fpState = fpu.NewState()`，
+  新状态全零，而扩展上下文仍写死 `FPU_CTX` 288 字节）
+
+**代价提醒**：这版把每任务 FP 保存区放大了 6.8 倍（272 → 1856 字节）。在没修好之前
+这个代价不值得，所以未合入生产；生产机仍是 `cadfa5a5`。

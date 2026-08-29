@@ -109,6 +109,20 @@ const (
 
 	// NT_ARM_TLS is for ARM TLS register.
 	NT_ARM_TLS = 0x401
+
+	// NT_LOONGARCH_LSX is the 128-bit Loongson SIMD Extension register file
+	// (struct user_lsx_state, 512 bytes). NT_PRFPREG only covers the low 64
+	// bits of each vector register, so the rest is lost without this.
+	NT_LOONGARCH_LSX = 0xa02
+
+	// NT_LOONGARCH_LASX is the 256-bit Loongson Advanced SIMD Extension
+	// register file (struct user_lasx_state, 1024 bytes). It supersedes
+	// NT_LOONGARCH_LSX where the CPU has it.
+	NT_LOONGARCH_LASX = 0xa03
+
+	// NT_LOONGARCH_LBT is the Loongson Binary Translation register file
+	// (struct user_lbt_state, 40 bytes).
+	NT_LOONGARCH_LBT = 0xa04
 )
 
 // ElfHeader64 is the ELF64 file header.

@@ -20,6 +20,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
 )
@@ -62,48 +63,58 @@ func (t *thread) setRegs(regs *arch.Registers) error {
 	return nil
 }
 
-// getFPRegs gets the floating-point data via the GETREGSET ptrace unix.
-func (t *thread) getFPRegs(fpState *fpu.State, ac *archContext) error {
-	iovec := unix.Iovec{
-		Base: fpState.BytePointer(),
-		Len:  ac.floatingPointLength(),
-	}
-	if iovec.Len == 0 {
-		return nil
-	}
-	_, _, errno := unix.RawSyscall6(
-		unix.SYS_PTRACE,
-		unix.PTRACE_GETREGSET,
-		uintptr(t.tid),
-		ac.floatingPointRegSet(),
-		uintptr(unsafe.Pointer(&iovec)),
-		0, 0)
-	if errno != 0 {
-		return errno
+// fpRegSetSpec describes one ptrace regset making up a thread's saved
+// floating-point state, and where it sits in the fpu.State buffer.
+//
+// Most architectures expose the whole thing as a single regset. LoongArch
+// splits it: NT_PRFPREG carries only the low 64 bits of each vector register,
+// and the rest lives in NT_LOONGARCH_LSX/LASX with NT_LOONGARCH_LBT alongside.
+type fpRegSetSpec struct {
+	note   uintptr
+	offset int
+	length int
+
+	// optional regsets are skipped when the host does not implement them,
+	// rather than failing the transfer.
+	optional bool
+}
+
+func (t *thread) transferFPRegs(fpState *fpu.State, ac *archContext, req uintptr) error {
+	for _, rs := range ac.fpRegSets() {
+		if rs.length == 0 {
+			continue
+		}
+		iovec := unix.Iovec{
+			Base: &(*fpState)[rs.offset],
+			Len:  uint64(rs.length),
+		}
+		_, _, errno := unix.RawSyscall6(
+			unix.SYS_PTRACE,
+			req,
+			uintptr(t.tid),
+			rs.note,
+			uintptr(unsafe.Pointer(&iovec)),
+			0, 0)
+		if errno != 0 {
+			if rs.optional {
+				log.Warningf("ptrace regset %#x (%d bytes at +%d) req %#x failed: %v",
+					rs.note, rs.length, rs.offset, req, errno)
+				continue
+			}
+			return errno
+		}
 	}
 	return nil
 }
 
+// getFPRegs gets the floating-point data via the GETREGSET ptrace unix.
+func (t *thread) getFPRegs(fpState *fpu.State, ac *archContext) error {
+	return t.transferFPRegs(fpState, ac, unix.PTRACE_GETREGSET)
+}
+
 // setFPRegs sets the floating-point data via the SETREGSET ptrace unix.
 func (t *thread) setFPRegs(fpState *fpu.State, ac *archContext) error {
-	iovec := unix.Iovec{
-		Base: fpState.BytePointer(),
-		Len:  ac.floatingPointLength(),
-	}
-	if iovec.Len == 0 {
-		return nil
-	}
-	_, _, errno := unix.RawSyscall6(
-		unix.SYS_PTRACE,
-		unix.PTRACE_SETREGSET,
-		uintptr(t.tid),
-		ac.floatingPointRegSet(),
-		uintptr(unsafe.Pointer(&iovec)),
-		0, 0)
-	if errno != 0 {
-		return errno
-	}
-	return nil
+	return t.transferFPRegs(fpState, ac, unix.PTRACE_SETREGSET)
 }
 
 // getSignalInfo retrieves information about the signal that caused the stop.
