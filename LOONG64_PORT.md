@@ -1157,3 +1157,49 @@ glibc 不在此列：它的 ifunc 走 HWCAP，而 `AllowedHWCap1` 已经把 LSX/
 **修法 2（真正保存/恢复向量状态）不是"更彻底的选择"，而是唯一的出路。**
 目前未做成，进度与已排除项见上面几节。在做成之前，跑 JVM 之类的负载应当视为
 存在静默数据损坏风险。
+
+## systrap 能否绕开向量状态问题：能 (2026-08-29)
+
+ptrace 平台在向量状态上卡死了（八九个假设全排除仍未定位）。换个角度看，**两个平台保存
+上下文的机制根本不同**，而 systrap 用的那条路实测是通的。
+
+| | 保存/恢复途径 | 向量状态 |
+|---|---|---|
+| ptrace | `PTRACE_GETREGSET` / `SETREGSET` | 丢失，原因未明 |
+| systrap | 内核填充的信号帧 `sc_extcontext` | **实测可行** |
+
+systrap 的 stub 是宿主进程，它的信号处理器拿到的是**内核构造**的信号帧。
+`~/systrap-probes/04-lasx-sigctx.c` 直接验证了这条路：
+
+```
+found record magic=0x41535801 size=1056        <- LASX 记录完整在 sc_extcontext 里
+after signal: xr0: dead0000 dead0001 dead0002 dead0003   <- 四个 lane 改写全部生效
+              xr1: dead0004 dead0005 dead0006 dead0007
+```
+
+也就是说 `sighandler_loong64.c` 只要**整块搬运 `sc_extcontext` 链**（遍历 sctx_info 到
+END 记录），向量状态就能正确随上下文走，不需要碰任何 ptrace regset。这一步在此前的
+可行性调研里已经验证过往返正确性（探针 `01`），现在进一步确认了**改写也生效**。
+
+### 顺带查出的第三个表现：guest 信号投递也丢向量高位
+
+同一个探针在 runsc 下跑：
+
+```
+runsc: no LSX/LASX record found in sc_extcontext
+       after signal: xr0 = 0000000000000011 0000000400000000 00000000005ebd40 00005554a2b74418
+                              ^ lane0 存活    ^^^^^^^^^^^^^^^ 高位是栈/堆地址残值
+```
+
+**gVisor 构造给 guest 的信号帧里没有向量记录**——`signal_loong64.go` 写死
+`FpuInfo: SctxInfo{Magic: _FPU_CTX_MAGIC, Size: 16+272}`。后果是 guest 每接一次信号，
+向量寄存器高位就被毁一次。这个缺陷**与平台无关**，systrap 也要修，改法是让
+`SignalSetup` / `SignalRestore` 按真实硬件的记录链构造扩展上下文。
+
+### 结论
+
+**systrap 是这个问题的可行出路**，且是目前唯一有实测支撑的出路。代价仍是此前调研中记录的
+那些：构建体系要引入 LoongArch C 交叉工具链、`sighandler_loong64.c` 约 222 行、
+约 800 行 Go/汇编、以及 SA_RESTORER 不可用需改成自发 `rt_sigreturn`（已验证可行）。
+
+在 systrap 做出来之前，ptrace 平台上**向量状态问题无解**（连规避手段都不存在，见上一节）。
