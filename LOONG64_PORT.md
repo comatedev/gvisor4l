@@ -814,3 +814,59 @@ pd+1192  reported_guard  = 0x4000               ok
 复现已进入秒级，可以负担 sentry 侧插桩迭代了。目标是找出 clone 路径上是谁写了那 8 字节：
 `kernel.Task.Clone` 的 TLS / `CLONE_CHILD_SETTID` / `CLONE_PARENT_SETTID` 写入点，
 以及 `mm` 在新建地址空间时对 guest 内存的写操作。
+
+### sentry 侧哨兵：那 8 字节不是 sentry 写的 (2026-08-29)
+
+在 `pkg/sentry/mm/io.go` 的 `CopyOut` 和 `SwapUint32` 上加了针对该常量的哨兵，命中即打印
+Go 调用栈。哨兵确实会触发（说明它工作正常），但**每一条触发的调用栈都是
+`proc.(*memFD).PRead`**——那是探测器自己通过 `/proc/self/mem` 读内存时，sentry 把含该常量
+的数据拷回 guest。**没有任何一条是真正的写入。**
+
+结论：**sentry 从未通过 `mm.CopyOut` 往 guest 写过这个值。** 写入不在 sentry 的这条路径上。
+
+（又一次被自己的探测器干扰：第一版探测器每轮启动都做全地址空间扫描，于是每轮都触发哨兵。
+去掉启动扫描后才看清。)
+
+### 常量与被测程序无关
+
+同一份源码用 `-O1` 和 `-O2` 编出两个 MD5 不同的二进制，各跑 6 轮 40 秒：
+
+```
+-O1  1/6 命中   stackblock = 0xa04c6c89993a3b3c
+-O2  1/6 命中   stackblock = 0xa04c6c89993a3b3c
+```
+
+命中率相同、常量逐位相同。**该值来自 gVisor 或运行环境，不是被测程序派生的。**
+
+### "写丢失"假设：合成负载复现不出来
+
+glibc 的 `allocate_stack()` 写入顺序是 `stackblock` → `stackblock_size` → `guardsize`，
+而每次命中都是第一个字段陈旧、后面两个正确——这正是"两次相邻写之间那一页被换掉"会产生的
+形态。于是做了两个合成测试：
+
+| 测试 | 序列 | 规模 | 结果 |
+|---|---|---|---|
+| `~/bss/lostwrite.c` | mmap → 写 → 立刻回读 | 6.5 万线程 | 零 |
+| `~/bss/lostwrite2.c` | mmap → 写 → **clone** → 回读 | 8.2 万线程 | 零 |
+
+两者都干净。所以要么真实路径里还有合成负载没模拟到的要素（glibc 的栈缓存、
+`_dl_allocate_tls` 对该区域的写、`CLONE_SETTLS`），要么机制并非"写丢失"。**假设未被证实。**
+
+### 当前状态小结
+
+| 项 | 状态 |
+|---|---|
+| 归因 | 确凿：MariaDB runsc 24/1318 vs runc 0/1317；探测器 runc 360 万线程零命中 |
+| 复现器 | `~/bss/thrbss.c`，40 秒一轮，约 1/6 轮命中 |
+| 损坏点 | `pd+1168`（`stackblock`）单字段，相邻字段完好 |
+| 写入时刻 | `pthread_create` 返回时已存在，即在 clone 期间或之前 |
+| 写入者 | **不是 sentry 的 `mm.CopyOut`**（哨兵已验证） |
+| 常量来源 | 未知；与程序无关，不在任何文件 / sentry / gofer / 健康 guest 中 |
+| 机制 | **未定**。寄存器污染、fork/COW、`$sp` 恢复、ABI 越界写、加载时清零、页面回收、写丢失——全部已用大样本排除 |
+
+调试用的 runsc 在龙芯机 `~/runsc-watch`（`b16d2470`）；生产机已恢复 `cadfa5a5`。
+那台机器上跑着的几个服务（comate-ai-backend、mysql、redis、caddy、byteCourt）**都用 runc**，
+不受本调查影响。
+
+下一步可走的方向：把哨兵扩到 `CopyOutFrom`（marshal 路径）与 `ZeroOut`；或反过来在
+guest 侧用 `userfaultfd`/`mprotect` 把 `pd` 所在页设为只读来捕获写入者。
