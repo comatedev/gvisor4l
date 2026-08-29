@@ -15,14 +15,11 @@
 package mm
 
 import (
-	"encoding/binary"
 	"fmt"
-	"runtime"
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
-	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -108,51 +105,8 @@ func translateIOError(ctx context.Context, err error) error {
 	return linuxerr.EFAULT
 }
 
-// debugWatchValue is the constant that keeps turning up in pd->stackblock of
-// freshly created loong64 threads. It is in no file, not in the sentry or gofer
-// image, and not in a healthy guest, so something computes it. This watch
-// answers one question: does it get written through the sentry's own
-// guest-memory write path, or by the guest itself? Debug aid; drop once known.
-const debugWatchValue uint64 = 0xa04c6c89993a3b3c
-
-func debugWatchBytes(what string, addr hostarch.Addr, src []byte) {
-	for i := 0; i+8 <= len(src); i++ {
-		if binary.LittleEndian.Uint64(src[i:i+8]) != debugWatchValue {
-			continue
-		}
-		var buf [8192]byte
-		n := runtime.Stack(buf[:], false)
-		log.Warningf("CORRUPTION-WATCH %s: writing %#x to guest %#x (byte %d of %d)\n%s",
-			what, debugWatchValue, uint64(addr)+uint64(i), i, len(src), string(buf[:n]))
-		return
-	}
-}
-
-// debugWatchBlocks scans destination blocks after a write.
-func debugWatchBlocks(what string, ar hostarch.AddrRange, ims safemem.BlockSeq) {
-	off := uint64(0)
-	for !ims.IsEmpty() {
-		b := ims.Head()
-		s := b.ToSlice()
-		for i := 0; i+8 <= len(s); i++ {
-			if binary.LittleEndian.Uint64(s[i:i+8]) != debugWatchValue {
-				continue
-			}
-			var buf [8192]byte
-			n := runtime.Stack(buf[:], false)
-			log.Warningf("CORRUPTION-WATCH %s: %#x present at guest %#x (range %#x-%#x)\n%s",
-				what, debugWatchValue, uint64(ar.Start)+off+uint64(i),
-				uint64(ar.Start), uint64(ar.End), string(buf[:n]))
-			return
-		}
-		off += uint64(len(s))
-		ims = ims.Tail()
-	}
-}
-
 // CopyOut implements usermem.IO.CopyOut.
 func (mm *MemoryManager) CopyOut(ctx context.Context, addr hostarch.Addr, src []byte, opts usermem.IOOpts) (int, error) {
-	debugWatchBytes("CopyOut", addr, src)
 	_, ok := mm.CheckIORange(addr, int64(len(src)))
 	if !ok {
 		return 0, linuxerr.EFAULT
@@ -415,12 +369,6 @@ func (mm *MemoryManager) EnsurePMAsExist(ctx context.Context, addr hostarch.Addr
 
 // SwapUint32 implements usermem.IO.SwapUint32.
 func (mm *MemoryManager) SwapUint32(ctx context.Context, addr hostarch.Addr, new uint32, opts usermem.IOOpts) (uint32, error) {
-	if new == uint32(debugWatchValue&0xffffffff) || new == uint32(debugWatchValue>>32) {
-		var buf [8192]byte
-		n := runtime.Stack(buf[:], false)
-		log.Warningf("CORRUPTION-WATCH SwapUint32: writing %#x to guest %#x\n%s",
-			new, uint64(addr), string(buf[:n]))
-	}
 	ar, ok := mm.CheckIORange(addr, 4)
 	if !ok {
 		return 0, linuxerr.EFAULT
@@ -632,18 +580,6 @@ func (mm *MemoryManager) handleASIOFault(ctx context.Context, addr hostarch.Addr
 //
 // Preconditions: 0 < ar.Length() <= math.MaxInt64.
 func (mm *MemoryManager) withInternalMappings(ctx context.Context, ar hostarch.AddrRange, at hostarch.AccessType, ignorePermissions bool, f func(safemem.BlockSeq) (uint64, error)) (int64, error) {
-	// CopyOut alone did not catch the write, so cover every internally-mapped
-	// write instead: imCopyOut, CopyOutFrom and ZeroOut all land here. Scan the
-	// destination after the copy rather than the source, since CopyOutFrom's
-	// data never exists as a flat slice. Debug aid; drop with debugWatchValue.
-	if at.Write {
-		orig := f
-		f = func(ims safemem.BlockSeq) (uint64, error) {
-			n, err := orig(ims)
-			debugWatchBlocks("withInternalMappings", ar, ims)
-			return n, err
-		}
-	}
 	// If pmas are already available, we can do IO without touching mm.vmas or
 	// mm.mappingMu.
 	mm.activeMu.RLock()
