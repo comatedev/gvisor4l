@@ -1116,3 +1116,44 @@ wrote = 0000000000000000 48be5bcafe7f0000 ffffffffffffffff ffffffffffffffff
 - 受影响的是用 `cpucfg` 而非 HWCAP 做特性探测的代码，**HotSpot 在 LoongArch 上正是如此**
 
 在能正确保存之前，让 guest 知道自己没有向量单元，比让它以为自己有要安全得多。
+
+### 更正：止血措施不存在，修法 2 是唯一出路
+
+上一节建议"拦截 `cpucfg` 清掉 LSX/LASX 位"作为止血措施。**这个建议是错的，ptrace 平台上
+做不到。** 逐条查证：
+
+| 途径 | 结论 |
+|---|---|
+| 陷入 `cpucfg` 指令 | 只有 KVM 有（`KVM_REG_LOONGARCH_CPUCFG`），ptrace 平台无此能力 |
+| 关闭 SIMD 的 prctl | 内核没有提供 |
+| 清 `CSR.EUEN` 的向量使能位 | CSR 是特权寄存器，用户态无法访问 |
+| 改写 `NT_LOONGARCH_CPUCFG` regset | **写入被接受但对指令无效**（实测见下） |
+
+最后一条实测（`~/bss/cpucfgset.c`）：
+
+```
+CPUCFG GET ok, 256 bytes; word2=0x007ccfc7 LSX=1 LASX=1
+CPUCFG SET ok (cleared LSX/LASX bits)                        <- 写入"成功"
+child after parent's write: cpucfg(2)=0x7ccfc7 LSX=1 LASX=1  <- 指令结果不变
+```
+
+该 regset 是信息性的，改它不影响硬件指令的返回值。
+
+### 因此这是本移植的一个已知不安全面
+
+**ptrace 平台无法阻止 guest 发现并使用向量单元，而 gVisor 又不保存这些寄存器。**
+两者叠加的后果是：任何执行向量指令的 guest 代码都会遭遇静默的数据损坏，
+且**没有配置层面的规避手段**。
+
+受影响的是不查 HWCAP、直接用 `cpucfg` 探测的代码：
+
+- **JIT**——HotSpot 在 LoongArch 上正是这样探测 CPU 特性的
+- 用 `-mlsx` / `-mlasx` 编译的第三方库（本机 gcc 默认支持这两个选项）
+- 手写向量汇编
+
+glibc 不在此列：它的 ifunc 走 HWCAP，而 `AllowedHWCap1` 已经把 LSX/LASX 滤掉了，
+实测容器内 memcpy 1MB 后向量寄存器完好。
+
+**修法 2（真正保存/恢复向量状态）不是"更彻底的选择"，而是唯一的出路。**
+目前未做成，进度与已排除项见上面几节。在做成之前，跑 JVM 之类的负载应当视为
+存在静默数据损坏风险。
