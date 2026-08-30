@@ -275,6 +275,57 @@ static void fpstate_to_extctx(uint8_t *fp, uint8_t *frame) {
   }
 }
 
+// Bits of CPUCFG word 2, from arch/loongarch/include/asm/cpu.h.
+#define CPUCFG2_LSX (1U << 6)
+#define CPUCFG2_LASX (1U << 7)
+
+static __inline uint32_t cpucfg(uint32_t word) {
+  uint32_t r;
+  __asm__ __volatile__("cpucfg %0, %1" : "=r"(r) : "r"(word));
+  return r;
+}
+
+// Returns non-zero if the chain carries an LSX or LASX record.
+//
+// Precondition: the chain has been validated by extctx_len.
+static int extctx_has_vector(const uint8_t *base) {
+  uint32_t off = 0;
+  for (;;) {
+    const struct sctx_info *h = (const struct sctx_info *)(base + off);
+    if (h->magic == 0) return 0;
+    if (h->magic == LSX_CTX_MAGIC || h->magic == LASX_CTX_MAGIC) return 1;
+    off += h->size;
+  }
+}
+
+// Executes one vector instruction, so that the kernel marks this thread's
+// vector context live.
+//
+// setup_extcontext() in arch/loongarch/kernel/signal.c picks the record to put
+// in a signal frame from thread_lasx_context_live() / thread_lsx_context_live(),
+// which are set the first time the thread traps into the vector unit and stay
+// set. A sysmsg thread that has not yet run guest code that uses vectors gets
+// FPU-only frames, and there is no record for restore_state to write the
+// context's vector state into -- a context that used LASX on one thread would
+// come back with only lane 0 of each register, the rest reading as the ~0 that
+// init_fp_ctx() leaves behind. That is precisely what this port measured before
+// this call existed.
+//
+// Both instructions are identities: or'ing a register with itself leaves its
+// value alone. Becoming live does clobber the upper lanes, but this is only
+// ever called during thread initialization, when no guest context is loaded.
+//
+// This is the one place in the stub allowed to touch the vector unit; the
+// build asserts that no other code does. Kept out of line so that assertion can
+// name it.
+static __attribute__((noinline)) void touch_vector_unit(uint32_t cfg2) {
+  if (cfg2 & CPUCFG2_LASX) {
+    __asm__ __volatile__("xvor.v $xr0, $xr0, $xr0");
+  } else if (cfg2 & CPUCFG2_LSX) {
+    __asm__ __volatile__("vor.v $vr0, $vr0, $vr0");
+  }
+}
+
 void __export_start(struct sysmsg *sysmsg, void *_ucontext) {
   panic(0x11111111, 0);
 }
@@ -290,6 +341,29 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
   uint32_t ctx_state = CONTEXT_STATE_INVALID;
   struct thread_context *ctx = NULL, *old_ctx = NULL;
   if (thread_state == THREAD_STATE_INITIALIZING) {
+    // Make this thread's vector context live before it runs any guest code,
+    // so every frame the kernel builds for it from here on has somewhere to
+    // put vector state. See touch_vector_unit.
+    //
+    // The frame in hand was built before the thread was live, so it still has
+    // no vector record; return through it and fault again to get one. The
+    // sentry starts a sysmsg thread with an all-zero register set and an era
+    // of 0, so returning re-executes the same faulting instruction fetch and
+    // lands back here -- with $s0 marking that this has already been done, so
+    // it happens exactly once even if the frame still comes back without a
+    // vector record. Nothing else has run in this thread, and no context is
+    // loaded yet, so both the register and the vector unit are ours to use.
+    {
+      uint8_t *extctx = (uint8_t *)ucontext->uc_mcontext.__extcontext;
+      uint32_t cfg2 = cpucfg(2);
+      if ((cfg2 & (CPUCFG2_LSX | CPUCFG2_LASX)) != 0 &&
+          ucontext->uc_mcontext.__gregs[23] == 0 && extctx_len(extctx) != 0 &&
+          !extctx_has_vector(extctx)) {
+        touch_vector_unit(cfg2);
+        ucontext->uc_mcontext.__gregs[23] = 1;
+        __export_restore_rt(siginfo);
+      }
+    }
     init_new_thread();
     goto init;
   }

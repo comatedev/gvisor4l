@@ -65,11 +65,23 @@ def cc_pie_obj(name, srcs, outs):
               # contain no vector instruction, and no floating point one
               # either. Fails the build rather than shipping a handler that
               # quietly disturbs the guest's registers.
+              #
+              # touch_vector_unit is the one exception -- it exists to execute
+              # a vector instruction, so that the kernel gives this thread's
+              # signal frames a vector record to save and restore through. It
+              # is compiled noinline so the assertion can skip its body and
+              # still cover everything else.
               select_arch(
                   # Bazel's cc_toolchain exposes $(CC), $(LD) and $(OBJCOPY)
                   # as make variables but not objdump, so name the tool the way
                   # cc_toolchain_config.bzl already names the rest of them.
-                  loong64 = " && ! /usr/bin/loongarch64-linux-gnu-objdump -d $@ | grep -qE" +
+                  loong64 = " && ! /usr/bin/loongarch64-linux-gnu-objdump -d $@" +
+                            # Compiler-generated .L blocks belong to whatever
+                            # function precedes them, so they must not reset
+                            # the skip.
+                            " | awk '/^[0-9a-f]+ <.*>:/ && $$0 !~ /<[.]L/" +
+                            " { skip = ($$0 ~ /<touch_vector_unit>:/) } !skip'" +
+                            " | grep -qE" +
                             " '\\b(x?v(ld|st|or|xor|repli|insgr|pickve)|" +
                             "f(add|sub|mul|div|ld|st|mov|cmp|int))'",
                   default = "",
