@@ -1,4 +1,4 @@
-// Copyright 2018 The gVisor Authors.
+// Copyright 2026 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,18 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package systrap
+//go:build loong64
+// +build loong64
 
-import (
-	"unsafe"
+#include "funcdata.h"
+#include "textflag.h"
 
-	"golang.org/x/sys/unix"
-	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/hostsyscall"
-)
+// spinloop pauses the pipeline inside a busy wait. LoongArch has no dedicated
+// hint instruction, so use the same barrier the stub's C code uses (dbar 0).
+TEXT ·spinloop(SB),NOSPLIT,$0
+	DBAR	$0
+	RET
 
-func (q *contextQueue) wakeupSysmsgThread() {
-	hostsyscall.RawSyscall(unix.SYS_FUTEX,
-		uintptr(unsafe.Pointer(&q.numThreadsToWakeup)),
-		linux.FUTEX_WAKE, 1)
-}
+// cputicks reads the constant frequency timer, which is what the stub reads
+// too (rdtime.d in sysmsg_lib.c), so the two are directly comparable.
+TEXT ·cputicks(SB),NOSPLIT,$0-8
+	RDTIMED	R0, R4
+	MOVV	R4, ret+0(FP)
+	RET

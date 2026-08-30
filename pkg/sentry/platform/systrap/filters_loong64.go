@@ -18,21 +18,21 @@
 package systrap
 
 import (
-	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/seccomp"
 )
 
-// stackPointer returns the user-mode stack pointer. On LoongArch this is just
-// $r3 in the GPR file; there is no separate Sp field as on arm64.
-func stackPointer(r *arch.Registers) uintptr {
-	return uintptr(r.Regs[3])
+// archSyscallFilters returns architecture-specific syscalls made exclusively
+// by the systrap platform.
+//
+// There are none on LoongArch. arm64 needs PTRACE_{GET,SET}REGSET on
+// NT_ARM_TLS to move the thread pointer, but LoongArch keeps it in $tp ($r2),
+// an ordinary general-purpose register that comes and goes with NT_PRSTATUS,
+// which the shared filters already allow.
+func archSyscallFilters() seccomp.SyscallRules {
+	return seccomp.MakeSyscallRules(nil)
 }
 
-// configureSystrapAddressSpace overrides the default address space parameters
-// when the host uses a different VA width.
-//
-// This function MUST be called during systrap initialization, before any
-// Context64 is created.
-func configureSystrapAddressSpace() {
-	arch.ConfigureAddressSpace(uintptr(linux.TaskSize))
+// hottestSyscalls returns the hottest syscalls used by the Systrap platform.
+func hottestSyscalls() []uintptr {
+	return nil
 }

@@ -36,6 +36,14 @@ uint64_t __export_stub_start;
 // symbol to write.
 uint64_t __export_disable_syscall_patching;
 
+// Bits of thread_context.err, which on LoongArch the stub synthesises rather
+// than copying out of the signal frame; see __export_sighandler.
+//
+// LINT.IfChange
+#define LOONG_FAULT_WRITE (1 << 0)
+#define LOONG_FAULT_INSTR (1 << 1)
+// LINT.ThenChange(../subprocess_loong64.go)
+
 // LoongArch has no sa_restorer, so the handler cannot return -- see
 // sigrestorer_loong64.S. It tail-calls this with the rt_sigframe base instead.
 extern void __export_restore_rt(void *frame) __attribute__((noreturn));
@@ -156,9 +164,24 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
 
   ctx->tls = get_tls();
   ctx->siginfo = *siginfo;
-  // LoongArch does not report a fault status register in the signal frame, so
-  // there is no equivalent of arm64's esr_context to read an access type from.
+
+  // LoongArch reports no fault status register in the signal frame, so there
+  // is no equivalent of arm64's esr_context to read an access type from.
+  // Synthesise the two bits the sentry needs from what the frame does carry.
+  //
+  // The write bit is not a guess about the instruction: SEGV_ACCERR says the
+  // mapping was present and the access was refused, and every host mapping
+  // the sentry installs is at least readable, so a refused access is a store
+  // to a page mapped read-only. A store to an address with no host mapping
+  // yet reports SEGV_MAPERR and is handled as a read; the sentry then maps
+  // the page read-only and the retried store takes the SEGV_ACCERR path, so
+  // it costs one extra fault rather than looping.
   ctx->err = 0;
+  if (signo == SIGSEGV || signo == SIGBUS) {
+    if (siginfo->si_code == SEGV_ACCERR) ctx->err |= LOONG_FAULT_WRITE;
+    if ((uint64_t)siginfo->si_addr == ucontext->uc_mcontext.__pc)
+      ctx->err |= LOONG_FAULT_INSTR;
+  }
 
   switch (signo) {
     case SIGSYS: {

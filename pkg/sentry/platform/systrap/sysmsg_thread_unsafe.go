@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !loong64
-// +build !loong64
-
 package systrap
 
 import (
@@ -73,12 +70,13 @@ func (p *sysmsgThread) init(sentryAddr, guestAddr uintptr) {
 //go:nosplit
 //go:norace
 func sysmsgSigactions(stubSysmsgStart uintptr) unix.Errno {
-	act := linux.SigAction{
-		Handler:  uint64(stubSysmsgStart) + uint64(sysmsg.Sighandler_blob_offset____export_sighandler),
-		Flags:    linux.SA_ONSTACK | linux.SA_RESTORER | linux.SA_SIGINFO,
-		Restorer: uint64(stubSysmsgStart) + uint64(sysmsg.Sighandler_blob_offset____export_restore_rt),
-		Mask:     1<<(linux.SIGCHLD-1) | 1<<(linux.SIGSYS-1),
-	}
+	// The layout of struct sigaction is architecture specific, so the value
+	// itself is built per architecture; see newHostSigAction.
+	act := newHostSigAction(
+		uint64(stubSysmsgStart)+uint64(sysmsg.Sighandler_blob_offset____export_sighandler),
+		uint64(stubSysmsgStart)+uint64(sysmsg.Sighandler_blob_offset____export_restore_rt),
+		1<<(linux.SIGCHLD-1)|1<<(linux.SIGSYS-1),
+	)
 
 	for _, s := range []unix.Signal{
 		unix.SIGSYS,

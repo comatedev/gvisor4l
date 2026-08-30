@@ -59,3 +59,25 @@ func appendSysThreadArchSeccompRules(rules []seccomp.RuleSet) []seccomp.RuleSet 
 		},
 	}...)
 }
+
+// hostSigAction is struct sigaction in the shape the host kernel expects.
+//
+// LINT.IfChange
+type hostSigAction = linux.SigAction
+
+// newHostSigAction builds the sigaction that sysmsgSigactions installs.
+//
+// amd64 defines __ARCH_HAS_SA_RESTORER, so the handler returns
+// through the restorer the kernel calls for it.
+//
+//go:nosplit
+func newHostSigAction(handler, restorer uint64, mask linux.SignalSet) hostSigAction {
+	return linux.SigAction{
+		Handler:  handler,
+		Flags:    linux.SA_ONSTACK | linux.SA_RESTORER | linux.SA_SIGINFO,
+		Restorer: restorer,
+		Mask:     mask,
+	}
+}
+
+// LINT.ThenChange(sysmsg_thread_loong64.go)

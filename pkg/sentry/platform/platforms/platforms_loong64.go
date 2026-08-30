@@ -16,10 +16,10 @@
 // +build linux,loong64,!debug
 
 // Package platforms imports the LoongArch64-supported platform packages.
-// We deliberately skip kvm and systrap on LoongArch since the port targets
-// only the ptrace platform.
+// kvm is skipped: the port does not implement it.
 package platforms
 
 import (
 	_ "gvisor.dev/gvisor/pkg/sentry/platform/ptrace"
+	_ "gvisor.dev/gvisor/pkg/sentry/platform/systrap"
 )
