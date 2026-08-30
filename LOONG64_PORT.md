@@ -1498,3 +1498,22 @@ ptrace   record magic = 0x46505501 (FPU)    f0  = 5a
 
 放开向量后的回归：`veccheck` 6,974,198 次 0 失败、`09-sigroundtrip` 5000 轮 0 失败、
 MariaDB 正常初始化并启动。
+
+### 第二轮 A/B（放开向量 + 新信号帧之后）
+
+```
+systrap   PASS=150  FAIL=0
+ptrace    PASS=147  FAIL=3
+```
+
+与第一轮合并：systrap 550/550，ptrace 535/550。
+
+### 已切换为默认平台 (2026-08-30)
+
+`/usr/local/bin/runsc` 换成 `d1d6f42a05b8`，docker 的 `runsc` runtime 改为
+`--platform=systrap`。旧二进制备份在 `/root/runsc-backup/runsc.prev-cadfa5a5-ptrace-20260830`。
+另外保留了 `runsc-systrap` / `runsc-ptrace` 两个 runtime 指向同一个二进制，方便再做 A/B。
+
+注意 `runsc` runtime 的 `runtimeArgs` 里仍然带着调查期间加的
+`--debug --debug-log=/var/log/runsc/ --strace`，开销不小（每次启动约 15MB 日志），
+排查结束后可以去掉。
