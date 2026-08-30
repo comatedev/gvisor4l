@@ -1593,3 +1593,128 @@ Bench（4 线程 × 1500 轮，
   String/Arrays intrinsics +
   排序 + 浮点，全部对照标量重算）  runc / systrap / ptrace 都 failures=0
 ```
+
+## 性能基线：runc vs systrap vs ptrace (2026-08-30)
+
+机器空闲（load 0.01），5 个生产容器在 runc 上跑着。三个 runtime 逐次交替，取中位数。
+基准用的是 **不带 `--debug` / `--strace`** 的 `runsc-systrap` / `runsc-ptrace`
+（生产的 `runsc` runtime 还带着排查期的调试参数，见文末）。
+
+### 微基准（静态链接的同一个二进制，`~/bench/micro.c`）
+
+```
+case                         runc    systrap     ptrace    systrap   ptrace
+                            ns/op      ns/op      ns/op      xrunc    xrunc
+---------------------------------------------------------------------------
+syscall getpid                193       6825      19797      35.4x   102.6x
+clock_gettime (vdso)           42         34         34       0.8x     0.8x
+stat                         1442      11627      27230       8.1x    18.9x
+open+close                   2886      22612      52069       7.8x    18.0x
+pread 4K (cached)             959      10088      25579      10.5x    26.7x
+pwrite 4K                    1924      11671      27558       6.1x    14.3x
+pwrite 4K + fsync          344607     444263     471270       1.3x     1.4x
+mmap+touch+munmap           13907      82605     107161       5.9x     7.7x
+thread create+join          28617   18159110   17903369     634.6x   625.6x
+fork+exit+wait             114247   10337246   10683317      90.5x    93.5x
+fork+exec+wait             374977   14036264   14154560      37.4x    37.7x
+memcpy 1MB (纯用户态)        59137      59081     100867       1.0x     1.7x
+```
+
+阻塞往返（两个线程之间，`~/bench/pingpong.c`）：
+
+```
+                        runc    systrap    ptrace
+pipe  ping-pong        8.4us     28.5us    96.8us
+futex ping-pong        7.3us     29.0us    76.7us
+```
+
+几条值得单独说的：
+
+- **`clock_gettime` 比宿主还快**（34ns vs 42ns），因为 sentry 的 VDSO 直接从参数页算，
+  省掉了内核入口。但**沙箱启动后头 1-2 秒 VDSO 不可用**：参数页要等 sentry 的时钟标定完成，
+  在那之前 `monotonic_ready = 0`，每次调用都回退到系统调用（7.6µs）。
+  短命容器吃不到这个快路径。测量时必须先热身，否则测的是未标定窗口。
+- **`memcpy` 在 ptrace 上慢 1.7 倍**，systrap 与 runc 持平。这正是放开向量 HWCAP 的收益：
+  systrap 通告 LSX/LASX，glibc 走向量版 memcpy；ptrace 不通告，退回标量。
+- **`fork` 慢 90 倍**有一部分是本移植自己加的：`TaskImage.Fork` 对父子两个 mm 都调
+  `PopulateAll`（提前破除 COW），用来绕开 LoongArch 内核 TLB 例外路径不恢复 t0/t1 的问题。
+  注意这段代码**没有加架构门**，在 `pkg/sentry/kernel/task_image.go` 这个通用文件里，
+  amd64/arm64 也一并付了代价——应该收进 loong64 专有路径。
+- **`thread create+join` 的 18ms 不是创建也不是回收的开销**。拆开看：
+
+  ```
+                                    runc    systrap
+    create only（线程都不退出）      27us      195us
+    join only（线程已在退出）        27us      541us
+    create + 立刻 join               30us    17865us
+    create + 睡 30ms + join          72us      911us
+  ```
+
+  也就是说，**join 一个刚刚退出的线程要 15.6ms**，先等 30ms 再 join 就不慢。
+  strace 显示父进程的 `futex(FUTEX_WAIT_BITSET)` 耗时 15.62ms 后返回 EAGAIN，
+  正好卡在子任务 `TaskExitInitiated -> TaskExitZombie` 之间。
+
+  这就是《② futex 屏障》里已经记录过的那件事：`futex.WaitPrepare` 每次真正阻塞前调用
+  `GlobalMemoryBarrier()` = `membarrier(MEMBARRIER_CMD_GLOBAL)` = `synchronize_rcu()`。
+  当时实测 park/unpark 15.34ms，与这次的 15.62ms 吻合。补充一个当时没记的观察：
+  **这个代价随系统负载剧烈变化**——上面 ping-pong 里 futex 往返只要 29µs，因为系统忙的时候
+  RCU 宽限期很快就结束；机器空闲时才会退化到十几毫秒。所以它对"偶尔建一个线程"的场景是灾难，
+  对持续压测的场景几乎看不见。
+
+### Redis（服务端受测，客户端固定在 runc，docker bridge 网络）
+
+```
+redis (rps)        runc    systrap     ptrace     systrap   ptrace
+------------------------------------------------------------------
+SET               42689      13865      12320         32%      29%
+GET               42508      14363      12895         34%      30%
+INCR              42464      14394      12870         34%      30%
+LPUSH             43011      14027      12821         33%      30%
+SADD              42194      14389      12920         34%      31%
+
+p50 (ms)          0.271      1.315      1.483
+容器启动 (s)        0.67       0.88       0.86
+```
+
+单线程事件循环的服务，systrap 拿到 runc 的三分之一，比 ptrace 好一成。
+
+### MariaDB（`mariadb-slap`，服务端受测，客户端固定在 runc）
+
+首次启动（`docker run` 到能应答 SQL，含初始化建库）：
+
+```
+runc 8.9-13.1s    systrap 13.3-18.4s    ptrace 17.3-26.4s
+```
+
+稳态吞吐，2000 条混合查询的平均耗时（越小越好，中位数）：
+
+```
+concurrency     runc   systrap    ptrace
+     1         1.604     1.995     2.187
+     4         0.753     2.083     1.883
+    16         0.800     2.517     1.777
+```
+
+**这里有一个和微基准相反的结果**：并发上去以后 systrap 反而不如 ptrace。
+runc 从 1.60 降到 0.75（并发有收益），ptrace 从 2.19 降到 1.78（也有收益），
+而 systrap 从 1.995 涨到 2.517（并发是负收益）。`--cpus=2` 和 `--cpus=4` 两种配额下
+都复现，两轮独立测量一致。
+
+微基准里 systrap 在同步和阻塞往返上都稳定领先 ptrace 三倍，所以这不是单次调用的开销问题，
+更像是 systrap 在**多 guest 线程并发**下的伸缩性问题（上下文队列 / sysmsg 线程数）。
+**没有进一步定位**，记在这里作为一个已知的、可复现的现象。
+
+### 生产 runtime 还带着调试参数
+
+`runsc` runtime 的 `runtimeArgs` 里仍有 `--debug --debug-log=/var/log/runsc/ --strace`。
+代价实测：
+
+```
+                  runsc(带调试)   runsc-systrap(不带)   倍数
+syscall getpid        23581 ns          6806 ns        3.5x
+stat                  39245 ns         11634 ns        3.4x
+open+close            73365 ns         22584 ns        3.2x
+pread 4K              75493 ns          9993 ns        7.6x
+```
+
+外加几秒钟就写出 39MB 日志。排查已经结束，建议去掉。
