@@ -24,15 +24,20 @@ import (
 
 // Clone implements linux syscall clone(2).
 //
-// LoongArch's mainline kernel selects CONFIG_CLONE_BACKWARDS (just like
-// arm64), so the legacy 5-argument signature applies:
+// LoongArch does not select CONFIG_CLONE_BACKWARDS, so the last two arguments
+// are in the order kernel/fork.c uses by default -- the same one x86_64 and
+// riscv64 use, not arm64's:
 //
-//	sys_clone(clone_flags, newsp, parent_tidptr, tls_val, child_tidptr)
+//	sys_clone(clone_flags, newsp, parent_tidptr, child_tidptr, tls_val)
+//
+// Confirmed by measurement on a 3A5000: a raw clone with two distinct mapped
+// pointers in arguments 4 and 5 gives the child a thread pointer equal to
+// argument 5.
 func Clone(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	flags := int(args[0].Int())
 	stack := args[1].Pointer()
 	parentTID := args[2].Pointer()
-	tls := args[3].Pointer()
-	childTID := args[4].Pointer()
+	childTID := args[3].Pointer()
+	tls := args[4].Pointer()
 	return clone(t, flags, stack, parentTID, childTID, tls)
 }
