@@ -1432,3 +1432,69 @@ assertion failed: freesize < size` 3 次、系统表初始化失败 6 次、其�
   要放开得先把平台信息传进去。
 - `signal_loong64.go` 给 guest 造的信号帧里那条 FPU 记录内容是全零、且没有向量记录
   （见上文更正）。读写 `uc_mcontext` 扩展上下文的 handler 会看到零。
+
+## 放开向量 HWCAP，并把 FP 状态真正装进 guest 信号帧 (2026-08-30)
+
+### AT_HWCAP：之前 guest 拿到的是两份互相矛盾的信息
+
+```
+宿主      AT_HWCAP = 0x1fff  cpucfg lam ual fpu lsx lasx crc32 complex crypto
+guest     AT_HWCAP = 0x004f  cpucfg lam ual fpu           crc32
+guest 的 /proc/cpuinfo:      cpucfg lam ual fpu lsx lasx crc32 complex crypto
+```
+
+`AllowedHWCap1()` 过滤了向量位，而 `/proc/cpuinfo` 走的是 `HasFeature()`，读的是
+未经过滤的 `hwCap1`，于是同一个问题有两个答案。
+
+现在过滤条件化：平台自己声明能不能保住向量寄存器。
+`cpuid.SetVectorStateSaved()` 做成包级函数，理由和 `arch.ConfigureAddressSpace()`
+是同一个——FeatureSet 在平台存在之前很久就建好了，而"能否保住"是平台的属性不是 CPU 的。
+默认 false，所以什么都不声明的 ptrace 保持原样。COMPLEX / CRYPTO 跟着 LSX / LASX 一起放开，
+因为它们就是用同一组寄存器的向量指令；LBT 不放开，本轮没测过。
+
+需要说清楚的是**过滤从来就不是一道防线**：glibc 在 LoongArch 上的 ifunc 分派看的是
+`cpucfg` 不是 HWCAP，guest 无论如何都会走到向量单元。过滤的实际作用只是让**确实检查
+HWCAP 的程序**不去依赖存不住的寄存器——顺带也把它们挡在了 libc 的向量例程之外，
+即使那些例程本来是安全的。
+
+```
+放开后（systrap）  AT_HWCAP = 0x01ff
+ptrace 仍然         AT_HWCAP = 0x004f
+```
+
+### guest 信号帧：之前那条 FPU 记录是空的
+
+`SignalSetup` 写死一条 FPU 记录且**内容全零**，`SignalRestore` 又完全不看帧、
+只从 `sigFPState` 弹回来。所以 handler 读 `uc_mcontext` 扩展上下文看到的是零，
+写进去也不生效；在有 LASX 的机器上更是连向量记录都没有，handler 只能够到每个寄存器的 lane 0。
+
+改成按 amd64 的做法（也是 Linux 的做法）：记录内容由任务真实的 FP 状态构造，
+`rt_sigreturn` 时再读回来。**发哪种记录跟着放开的 HWCAP 走**而不是跟着硬件走，
+这样帧和 exec 时告诉 guest 的事情一致——不保向量状态的平台不会声明 LSX/LASX，
+guest 在那里拿到的就是 FPU 记录，也正是那个平台唯一保得住的部分。
+
+`sigFPState` 保留，作为 handler 修改的**基底**：帧里解析不出来的链就原样用基底，
+而不是让 sigreturn 失败，因为基底才是应该恢复回去的状态。
+
+不做消毒（amd64 要消毒 XSAVE 头）。这条路径没有任何新的可达面：
+应用本来就能用普通指令写这些寄存器，`fcsr` / `fcc` 也一样，而硬件会忽略两者的保留位。
+
+`sigcontext` 的记录是变长的，所以 `SignalContext64` 只保留固定前缀，记录单独写——
+而且要**倒着写**，因为栈是向下写的。帧的落位经过挑选，使 LASX 记录体正好落在
+32 字节边界上，和内核 `extframe_alloc()` 的效果一致。
+
+### 实测（同一探针，裸机 / systrap / ptrace 三处对照）
+
+```
+10-frame-contents：置 $xr0 = 0x5a，用裸 syscall 发信号（中间不跑 libc），handler 读记录
+
+裸机     record magic = 0x41535801 (LASX)   xr0 = 5a 5a 5a 5a
+systrap  record magic = 0x41535801 (LASX)   xr0 = 5a 5a 5a 5a
+ptrace   record magic = 0x46505501 (FPU)    f0  = 5a
+
+04-lasx-sigctx：handler 改写记录后自发 rt_sigreturn
+裸机 / systrap  改写在四个 lane 上都生效
+```
+
+放开向量后的回归：`veccheck` 6,974,198 次 0 失败、`09-sigroundtrip` 5000 轮 0 失败、
+MariaDB 正常初始化并启动。
