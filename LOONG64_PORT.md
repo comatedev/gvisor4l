@@ -1384,3 +1384,51 @@ veccheck  4 线程 60 秒
   systrap  2000 轮 0 失败
   ptrace   2000 轮 1 失败
 ```
+
+## 原始故障：A/B soak 判定 (2026-08-30)
+
+把最初那个 MariaDB 故障拿回来做对照。这次是**同一个 runsc 二进制、同一台机器、
+同样的内存压力**，逐次交替，唯一的差别是 `--platform`：
+
+```
+docker run --rm --runtime=runsc-{systrap,ptrace} -m 1g ... mariadb_260807 sleep 1s
+MemAvailable 稳定在 1.3-1.5Gi（~/ballast 占住 3.65Gi）
+
+systrap   PASS=400  FAIL=0
+ptrace    PASS=388  FAIL=12
+Fisher 精确检验 双侧 p = 4.5e-4
+```
+
+12 次失败的 signature：`Fatal glibc error: allocatestack.c:194 (advise_stack_range):
+assertion failed: freesize < size` 3 次、系统表初始化失败 6 次、其余 3 次是
+启动中 `SIGABRT`（rc=134）。全是 8 月 27 日那次的同一族故障。
+
+### 这也给"那 8 字节从哪来"提供了解释
+
+此前查了很久的现象是：`pthread_create` 返回时 `pd->stackblock`（`pd+1168`）已经是错的，
+而写进去的常量（`0xa04c6c89993a3b3c`）**在 libc、ld.so、被测程序、runsc 二进制、
+运行中的 sentry、gofer、健康 guest 里都找不到**。
+
+向量寄存器丢高位可以解释这一点：glibc 的 `memcpy` / `memset` 在 LoongArch 上走 LSX 路径，
+`allocate_stack` 里那次结构体拷贝如果有一个 lane 是从**别的上下文残留**的数据来的，
+写进 `pd` 的就是一个哪里都搜不到的 8 字节——因为它根本不是数据，是另一个上下文的寄存器残值。
+
+需要说明的是**这条因果链没有被直接抓到现行**（没有捕获到那次写本身）。
+成立的是统计结论：换掉平台之后故障消失，p = 4.5e-4。
+
+### ptrace 平台的处置
+
+向量缺陷在 ptrace 上无解（`cpucfg` 不能在 KVM 之外陷入、没有 prctl、`CSR.EUEN` 是特权的、
+写 `NT_LOONGARCH_CPUCFG` 不影响指令行为），因此：
+
+- **建议把 loong64 的默认平台切到 systrap**；
+- ptrace 平台应视为已知会静默损坏使用向量的 guest（含所有用 glibc 的程序，
+  因为 glibc 的 ifunc 不看 HWCAP 而看 `cpucfg`）。
+
+### 未做的后续
+
+- `AllowedHWCap1` 仍然把 LSX / LASX 过滤掉。在 systrap 上这已经没有必要，
+  放开可以让 glibc 用上向量版的字符串 / 内存例程；但 `cpuid` 目前不知道平台，
+  要放开得先把平台信息传进去。
+- `signal_loong64.go` 给 guest 造的信号帧里那条 FPU 记录内容是全零、且没有向量记录
+  （见上文更正）。读写 `uc_mcontext` 扩展上下文的 handler 会看到零。
