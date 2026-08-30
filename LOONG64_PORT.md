@@ -1517,3 +1517,79 @@ ptrace    PASS=147  FAIL=3
 注意 `runsc` runtime 的 `runtimeArgs` 里仍然带着调查期间加的
 `--debug --debug-log=/var/log/runsc/ --strace`，开销不小（每次启动约 15MB 日志），
 排查结束后可以去掉。
+
+## musl 上跑 Java：`clone(2)` 参数顺序错了 (2026-08-30)
+
+拿 Alpine 上的 `openjdk21-loongarch-jdk` 试 systrap，JVM 起不来——两个平台都不行，
+**换成移植早期的二进制也一样**，所以不是这次改动引入的。
+
+```
+runc      openjdk version "21.0.9" ... 正常
+systrap   rc=139（有时 124 挂住）
+ptrace    rc=139
+runsc-old rc=139        ← 移植早期的构建，同样失败
+```
+
+### 定位过程
+
+1. `_JAVA_LAUNCHER_DEBUG=1` 显示崩在 `LoadJavaVM` 之后、`JavaVM args` 之前，
+   也就是 `JNI_CreateJavaVM` 里，且崩在**线程 2**。
+2. sentry 日志：`Unhandled user fault: addr=0 ip=... access=r--`。
+   ip 不在 libjvm.so 的映射范围内（`0x7efede404000-0x7efedf8b8000`）。
+3. 让容器里另一个进程轮询 `/proc/<java>/maps`，拿到 ld-musl 的基址，
+   算出出错偏移 **ld-musl + 0x77d40**，反汇编：
+
+```
+77d34:  ld.d    $t1, $tp, -8        ← self->dtv_copy
+77d40:  ldptr.d $s2, $t1, 0         ← 崩在这里，$t1 == 0
+```
+
+`$tp - 8` 是 musl `struct pthread` 的 `dtv_copy`（loongarch64 是 TLS_ABOVE_TP，
+`tp = pthread + sizeof(struct pthread)`）。它是 0，说明**线程的 `$tp` 根本不对**。
+
+（gdb 在 gVisor 里跑不起来，容器内 ptrace 不可用；这是另一个已知限制。）
+
+### 根因
+
+LoongArch **不选** `CONFIG_CLONE_BACKWARDS`，所以 `clone(2)` 的后两个参数是
+`kernel/fork.c` 的默认顺序（和 x86_64 / riscv64 一样，不是 arm64 那样）：
+
+```
+sys_clone(clone_flags, newsp, parent_tidptr, child_tidptr, tls_val)
+```
+
+移植时照抄了 arm64 的，把 `tls` 和 `child_tidptr` 对调了。后果是
+`CLONE_SETTLS` 把新线程的 `$tp` 设成了调用者传的 `child_tidptr`，而
+`CLONE_CHILD_SETTID` / `CLEARTID` 把 tid（以及线程退出时的 0）写进了调用者当作
+线程指针的那块内存。
+
+实测（`11-clone-argorder`：裸 clone，第 4、5 个参数放两个不同的已映射指针，
+子线程报自己的 `$tp`）：
+
+```
+裸机     child $tp = arg5      ← 默认顺序
+sandbox  child $tp = arg4      ← 错
+修好后   child $tp = arg5
+```
+
+### 为什么一直没被发现
+
+**glibc 走 `clone3`**，参数在结构体里，没有顺序可错；此前测过的负载全是 glibc。
+**musl 走传统 `clone`**，所以 Alpine 上任何开线程的程序从来就没跑通过。
+
+```
+glibc 程序（veccheck）  strace:  2 × clone3(
+musl 程序（java）       strace:  1 × clone(
+```
+
+这也说明它和之前那个 `pd->stackblock` 损坏是两回事——mariadb 是 glibc，走 clone3，
+不受这个 bug 影响。
+
+### 修好之后
+
+```
+java -version                     systrap / ptrace 都正常
+Bench（4 线程 × 1500 轮，
+  String/Arrays intrinsics +
+  排序 + 浮点，全部对照标量重算）  runc / systrap / ptrace 都 failures=0
+```
