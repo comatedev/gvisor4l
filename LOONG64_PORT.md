@@ -1192,9 +1192,25 @@ runsc: no LSX/LASX record found in sc_extcontext
 ```
 
 **gVisor 构造给 guest 的信号帧里没有向量记录**——`signal_loong64.go` 写死
-`FpuInfo: SctxInfo{Magic: _FPU_CTX_MAGIC, Size: 16+272}`。后果是 guest 每接一次信号，
-向量寄存器高位就被毁一次。这个缺陷**与平台无关**，systrap 也要修，改法是让
-`SignalSetup` / `SignalRestore` 按真实硬件的记录链构造扩展上下文。
+`FpuInfo: SctxInfo{Magic: _FPU_CTX_MAGIC, Size: 16+272}`。这个缺陷与平台无关。
+
+> **更正 (2026-08-30)**：当时把后果写成"guest 每接一次信号，向量寄存器高位就被毁一次"，
+> 这说过头了。上面那次观测是在 ptrace 平台下做的，分不清是信号帧的问题还是平台
+> 上下文切换的问题。systrap 做出来后单独测了一遍（`09-sigroundtrip`：置位向量寄存器、
+> 收一个什么都不做的信号、读回）：
+>
+> ```
+> 裸机     RESULT rounds=2000 signals=2000 bad=0
+> systrap  RESULT rounds=2000 signals=2000 bad=0
+> ptrace   RESULT rounds=2000 signals=2000 bad=1   (高位 = ffffffffffffffff)
+> ```
+>
+> **应用可见的向量状态是能跨 guest 信号存活的**，因为 `SignalSetup` 把 `c.fpState`
+> 压进 `sigFPState`、`SignalRestore` 再弹回来，走的不是信号帧。真正的缺陷窄得多：
+> 帧里那条 FPU 记录内容是全零而不是应用真实的 FP 状态，且没有向量记录，所以
+> **读写 `uc_mcontext` 扩展上下文的 handler 看到的是零、改了也不生效**。这与 Linux 不符，
+> 仍应修（让 `SignalSetup` / `SignalRestore` 按真实硬件的记录链构造），但它不是
+> 一个静默毁数据的缺陷。
 
 ### 结论
 
