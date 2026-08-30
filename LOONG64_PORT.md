@@ -1930,3 +1930,64 @@ mmap+touch+munmap        82.7us    65.2us
 ```
 
 其余项（syscall、stat、文件 IO、memcpy）不变。
+
+## 待办：评审剩下的两条 (记于 2026-08-31)
+
+这两条都和 ⑤ 同一个形态——**为某个具体症状加在通用代码里的处置，症状的真正成因没查清**。
+⑤ 的经验是：真正的成因后来被别的修复解决了，处置本身反而成了代价。所以这两条的正确做法
+不是直接改回上游，而是**先查清当初那个症状现在还在不在，成因是什么**。
+
+### #6 membarrier 的 PRIVATE_EXPEDITED 自动注册
+
+位置：`pkg/sentry/syscalls/linux/sys_membarrier.go`，`MEMBARRIER_CMD_PRIVATE_EXPEDITED` 分支。
+
+上游行为：
+
+```go
+if cmd == linux.MEMBARRIER_CMD_PRIVATE_EXPEDITED && !t.MemoryManager().IsMembarrierPrivateEnabled() {
+        return 0, nil, linuxerr.EPERM
+}
+```
+
+本移植改成了"没注册就自动注册"，注释写的理由是：*OpenJDK 先注册、再靠
+PRIVATE_EXPEDITED 做全局安全点，这里返回 EPERM 会让 JVM 死在 futex 里*。
+影响所有架构（通用文件）。Linux 的语义是未注册必须 EPERM。
+
+**注释自身就自相矛盾，这是查下去的入口**：如果 OpenJDK 确实先注册了，就不该走到
+EPERM 那条路。所以真正的问题多半是**注册状态丢了**，而不是不该返回 EPERM。
+
+已查到的线索：`membarrierPrivateEnabled` 是 `MemoryManager` 上的字段
+（`pkg/sentry/mm/mm.go`），而 `pkg/sentry/mm/lifecycle.go` 的 `Fork()` **不复制它**——
+gVisor 里 fork 出来的 mm 一律是未注册状态。需要确认的是 Linux 在 fork 时是否继承
+`mm->membarrier_state`（`membarrier_exec_mmap()` 只在 exec 时重置）。若 Linux 继承而
+gVisor 不继承，那才是真正的 bug，修在 `Fork()` 里，`sys_membarrier.go` 可以原样回到上游。
+
+测试覆盖：**没有**。`test/syscalls/linux/membarrier.cc` 里一处 EPERM 断言都没有，
+用例都是先 `REGISTER_PRIVATE_EXPEDITED` 再调用，捕不到这个改动。
+
+验证标准：照 ⑤ 的做法——改回上游后跑 50 次 JVM 启动（`jbench_loong64` 跑完整 JBench），
+外加一轮 park/unpark 压测。死锁会表现为挂死，所以全部套 timeout 看退出码。
+
+### #7 /proc/stat 的伪造常量
+
+位置：`pkg/sentry/fsimpl/proc/tasks_files.go`，`statData.Generate`。
+
+上游是 `cpu := cpuStats{}`（全零）；本移植改成
+
+```go
+cpu := cpuStats{user: 2000, nice: 100, system: 1000, idle: 200000, ioWait: 50, irq: 10, softirq: 20}
+```
+
+然后**同一个值**既打印成汇总的 `cpu` 行，又打印成每一条 `cpuN` 行。三个问题：
+
+1. Linux 保证汇总行是各 per-CPU 行之和。这里 4 核时汇总说 2000，明细 4×2000，对不上。
+2. 是常量，所以任何按差值算 CPU 占用率的工具（top、htop、容器监控、JVM 的
+   `OperatingSystemMXBean`）永远读到 0%。全零至少是自洽的，这个改动没解决问题反而引入了不一致。
+3. 通用文件，所有架构生效。
+
+来自最初那个大移植 commit `335efda5e`，**没有留下动机记录**，文档里也没有。
+猜测是某个工具除以总 jiffies 时除零或得到 NaN，但没有证据。
+
+修的方向：真值。sentry 本来就有每个任务的 CPU 时间统计
+（`kernel.Task` 的 `CPUStats`），汇总到 `/proc/stat` 是可行的；退一步至少让
+汇总行等于 per-CPU 之和。动手前先把动机查出来——`git log -S` 找不到就翻当时的容器日志。
