@@ -61,15 +61,20 @@ const (
 // SyscallWidth is the width of LoongArch's `syscall 0` instruction (4 bytes).
 const SyscallWidth = 4
 
-// LoongArch (mainline Linux) uses a single 48-bit user VA window with 4-level
-// page tables and 16K pages, so unlike arm64 we have just one configuration.
+// LoongArch (mainline Linux) has a single user VA window, so unlike arm64 we
+// have just one configuration.
+//
+// It is 47 bits wide, not 48: with 16K pages a page table level indexes
+// 16384/8 = 2048 entries, so four levels reach 14 + 11*3 = 47 bits. That is
+// what Linux computes for VA_BITS and what pkg/abi/linux/mm_loong64.go probes
+// for, and it is what ConfigureAddressSpace is handed.
 const (
-	maxAddr64                hostarch.Addr = 1 << 48
+	maxAddr64                hostarch.Addr = 1 << 47
 	maxMmapRand64            hostarch.Addr = 1 << 30 // 1 GiB, conservative
 	minMmapRand64            hostarch.Addr = 1 << 18 // 256 KiB
 	maxStackRand64           hostarch.Addr = 0x3ffff << hostarch.PageShift
-	preferredTopDownAllocMin hostarch.Addr = 0x7e8000000000
-	preferredAllocationGap   hostarch.Addr = 128 << 30 // 128 GiB
+	preferredTopDownAllocMin hostarch.Addr = 0x3f4000000000 // ~49% of the window, as on arm64
+	preferredAllocationGap   hostarch.Addr = 128 << 30      // 128 GiB
 	preferredPIELoadAddr     hostarch.Addr = maxAddr64 / 6 * 5
 )
 
@@ -86,10 +91,14 @@ var (
 	CPUIDInstruction = []byte{}
 )
 
-// ConfigureAddressSpace is a no-op on LoongArch64 because we only support
-// the canonical 48-bit task layout. Provided for interface parity with arm64.
+// ConfigureAddressSpace is a no-op on LoongArch64 because there is only one
+// task layout to select. It exists for interface parity with arm64, and to
+// assert that the host's window is the one the constants above describe.
+//
+// Every platform MUST call this function exactly once during initialization,
+// before any Context64 is created.
 func ConfigureAddressSpace(taskSize uintptr) {
-	if taskSize != 1<<48 {
+	if taskSize != uintptr(maxAddr64) {
 		panic(fmt.Sprintf("unsupported LoongArch64 task size: %#x", taskSize))
 	}
 }

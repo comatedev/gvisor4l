@@ -132,6 +132,15 @@ static void gregs_to_ptregs(ucontext_t *ucontext,
     ptregs->regs[i] = ucontext->uc_mcontext.__gregs[i];
   }
   ptregs->csr_era = ucontext->uc_mcontext.__pc;
+
+  // The sentry reads the first syscall argument out of orig_a0, because on the
+  // syscall path $a0 doubles as the return register (see SyscallArgs in
+  // pkg/sentry/arch/syscalls_loong64.go). struct sigcontext has no orig_a0 --
+  // it carries only sc_pc, sc_regs[32] and sc_flags -- so unlike the ptrace
+  // platform, which gets the field from NT_PRSTATUS, the stub has to supply
+  // it. $a0 in the frame is still the argument: measured on a 3A5000 with a
+  // SECCOMP_RET_TRAP filter, the value passed in $a0 is what the handler sees.
+  ptregs->orig_a0 = ucontext->uc_mcontext.__gregs[4];
 }
 
 static void ptregs_to_gregs(ucontext_t *ucontext,
