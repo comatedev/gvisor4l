@@ -47,10 +47,10 @@ const (
 	// a buffer. Both are carried and both are optional; on restore LSX is
 	// applied first and LASX, where the CPU has it, overwrites at full width.
 	//
-	// Choosing between them from a feature bit does not work: the sentry's
-	// FeatureSet is the guest-visible one and AllowedHWCap1 filters both out,
-	// so HasFeature(LASX) is false even on hardware that has it. Attempt each
-	// instead and let the kernel reject what it does not implement.
+	// Which of them a given host implements is discovered by attempting each
+	// and letting the kernel reject what it does not have, rather than from
+	// a feature bit: the ptrace platform moves this state before any guest
+	// exists to ask about.
 	//
 	// LINT.IfChange
 	LoongLSXOffset = LoongFPRegsOffset + LoongFPRegsSize

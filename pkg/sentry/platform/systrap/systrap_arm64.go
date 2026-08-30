@@ -32,3 +32,11 @@ func stackPointer(r *arch.Registers) uintptr {
 func configureSystrapAddressSpace() {
 	arch.ConfigureAddressSpace(uintptr(linux.TaskSize))
 }
+
+// declareVectorStateSaved tells cpuid whether this platform carries the vector
+// register file across context switches, which decides whether the guest is
+// told the vector extensions exist.
+//
+// Nothing to declare here: fpsimd_context covers the whole register file, and AllowedHWCap1
+// on arm64 does not consult this.
+func declareVectorStateSaved() {}

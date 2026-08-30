@@ -33,9 +33,8 @@ const (
 	LoongArch64FeatureFPU
 
 	// LoongArch64FeatureLSX indicates the 128-bit Loongson SIMD Extension is
-	// available. gVisor on LoongArch64 does NOT save/restore LSX state across
-	// context switches; this bit is kept here only for /proc/cpuinfo
-	// reporting and is filtered out by allowedHWCap1 below.
+	// available. Whether it is advertised to the guest depends on the
+	// platform in use; see AllowedHWCap1 and cpuid.SetVectorStateSaved.
 	LoongArch64FeatureLSX
 
 	// LoongArch64FeatureLASX indicates the 256-bit Loongson Advanced SIMD
@@ -52,7 +51,6 @@ const (
 	// LoongArch64FeatureCRYPTO indicates crypto instructions are available.
 	LoongArch64FeatureCRYPTO
 )
-
 
 // allFeatures provides the reverse mapping from Feature to the
 // /proc/cpuinfo flag plus a "supported" bit. The map ordering is

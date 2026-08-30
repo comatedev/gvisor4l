@@ -43,3 +43,11 @@ func (t *thread) setTLS(tls *uint64) error {
 // address space layout is fixed and does not require dynamic
 // configuration, so this is intentionally empty.
 func configureSystrapAddressSpace() {}
+
+// declareVectorStateSaved tells cpuid whether this platform carries the vector
+// register file across context switches, which decides whether the guest is
+// told the vector extensions exist.
+//
+// Nothing to declare here: the XSAVE area covers every extended register, and AllowedHWCap1
+// on amd64 does not consult this.
+func declareVectorStateSaved() {}

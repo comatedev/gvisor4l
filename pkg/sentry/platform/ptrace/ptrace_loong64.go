@@ -29,7 +29,6 @@ import (
 type archContext struct {
 	// fpLen is the size of the whole floating-point save area.
 	fpLen int
-
 }
 
 // init initializes the archContext.
@@ -56,7 +55,11 @@ func (a *archContext) floatingPointRegSet() uintptr {
 // it drops the upper 192 bits of every LASX register whenever a thread is
 // descheduled. A guest reaches the vector unit whether or not HWCAP advertises
 // it, since cpucfg reports the real hardware, so the state has to be carried
-// even though AllowedHWCap1 filters LSX and LASX out.
+// even though this platform does not declare it (see cpuid.SetVectorStateSaved,
+// which only systrap calls) and so leaves LSX and LASX out of HWCAP.
+//
+// Carrying it here is still not enough -- the upper lanes are lost anyway, and
+// that is why the port recommends systrap. See LOONG64_PORT.md.
 //
 // The vector and LBT regsets are optional: a CPU or kernel without them makes
 // PTRACE_GETREGSET fail, which is not an error for us.

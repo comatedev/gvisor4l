@@ -295,6 +295,10 @@ func New(opts platform.Options) (*Systrap, error) {
 		// Configure address space parameters for the current host's
 		// VA width. Must be called before any Context64 is created.
 		configureSystrapAddressSpace()
+		// Tell cpuid what this platform guarantees about CPU state, so
+		// the guest is not told about registers that would not survive.
+		// Must be called before any guest runs.
+		declareVectorStateSaved()
 		// Don't use sentry and stub fast paths if here is just one cpu.
 		neverEnableFastPath = min(runtime.NumCPU(), runtime.GOMAXPROCS(0)) == 1
 

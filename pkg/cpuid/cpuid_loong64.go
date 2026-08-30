@@ -20,6 +20,7 @@ package cpuid
 import (
 	"fmt"
 	"io"
+	"sync/atomic"
 )
 
 // FeatureSet for LoongArch64. Like arm64, there's no in-CPU CPUID-equivalent
@@ -42,6 +43,10 @@ func (fs FeatureSet) CPUModel() string {
 // area. It covers the base FP file (NT_PRFPREG) plus the vector and binary
 // translation register files, which live in their own ptrace regsets; see
 // fpu.LoongFPRegsOffset and friends for the layout.
+//
+// This does not depend on SetVectorStateSaved: the buffer is the same size
+// either way, and a platform that cannot fill all of it simply leaves part of
+// it alone.
 //
 // Saving only NT_PRFPREG is not enough: it holds the low 64 bits of each
 // vector register, so the upper 192 bits of every LASX register are dropped
@@ -93,16 +98,48 @@ func (FeatureSet) archCheckHostCompatible(FeatureSet) error {
 	return nil
 }
 
-// AllowedHWCap1 returns the HWCAP1 bits the guest may rely on. LSX and LASX
-// are intentionally filtered out because the gVisor LoongArch port does not
-// save/restore vector state across context switches.
+// vectorStateSaved records whether the platform in use saves and restores the
+// vector register file across context switches. It is false until a platform
+// says otherwise, because that is the conservative answer.
+//
+// This is a package-level variable for the same reason arch.ConfigureAddressSpace
+// is a package-level function: the FeatureSet is built long before a platform
+// exists, and the property being described belongs to the platform, not the CPU.
+var vectorStateSaved atomic.Bool
+
+// SetVectorStateSaved records that the platform in use carries the LSX/LASX
+// register file across context switches, which makes it safe to advertise
+// those extensions to the guest.
+//
+// A platform MUST call this during initialization, before any guest runs.
+func SetVectorStateSaved(saved bool) {
+	vectorStateSaved.Store(saved)
+}
+
+// AllowedHWCap1 returns the HWCAP1 bits the guest may rely on.
+//
+// The vector extensions are advertised only when the platform preserves their
+// registers; see SetVectorStateSaved. Filtering them out is not a defence --
+// glibc's ifunc resolvers on LoongArch dispatch on cpucfg, not HWCAP, so a
+// guest reaches the vector unit either way -- it just stops programs that do
+// check HWCAP from relying on registers that will not survive.
+//
+// COMPLEX and CRYPTO are gated with them because they are LSX/LASX
+// instructions and use the same register file. LBT is not advertised at all:
+// its state is carried, but nothing here has exercised it.
 func (fs FeatureSet) AllowedHWCap1() uint64 {
-	const allowed = HWCAP_LOONGARCH_CPUCFG |
+	allowed := uint64(HWCAP_LOONGARCH_CPUCFG |
 		HWCAP_LOONGARCH_LAM |
 		HWCAP_LOONGARCH_UAL |
 		HWCAP_LOONGARCH_FPU |
-		HWCAP_LOONGARCH_CRC32
-	return fs.hwCap.hwCap1 & uint64(allowed)
+		HWCAP_LOONGARCH_CRC32)
+	if vectorStateSaved.Load() {
+		allowed |= HWCAP_LOONGARCH_LSX |
+			HWCAP_LOONGARCH_LASX |
+			HWCAP_LOONGARCH_COMPLEX |
+			HWCAP_LOONGARCH_CRYPTO
+	}
+	return fs.hwCap.hwCap1 & allowed
 }
 
 // AllowedHWCap2 returns the HWCAP2 bits the guest may rely on. LoongArch
