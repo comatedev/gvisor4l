@@ -1718,3 +1718,75 @@ pread 4K              75493 ns          9993 ns        7.6x
 ```
 
 外加几秒钟就写出 39MB 日志。排查已经结束，建议去掉。
+
+## Java 效率 (2026-08-30)
+
+Alpine + `openjdk21-loongarch-jdk`，`--cpus=4 -m 2g`，三个 runtime 逐次交替、取中位数。
+
+### 默认参数
+
+```
+                            runc    systrap     ptrace    systrap   ptrace
+--------------------------------------------------------------------------
+java -version               0.51s      2.74s      3.19s      5.4x     6.3x
+java Hello                  0.52s      2.86s      3.23s      5.5x     6.2x
+javac JBench.java           0.70s      7.45s      8.72s     10.6x    12.5x
+-- 同一个 JVM 内 --
+compute（JIT 后的纯 CPU）    221ms      352ms      344ms      1.6x     1.6x
+alloc（分配 + GC）           499ms    13905ms    15033ms     27.9x    30.1x
+strings/regex                91ms      528ms     1273ms      5.8x    14.0x
+pool（8 线程跑 2 万个任务）   60ms      936ms     1016ms     15.6x    16.9x
+fileio（写+读 4K）           221us     5930us     7011us     26.8x    31.7x
+Thread create+join           170us    59135us    68495us    347.9x   402.9x
+```
+
+### 三条需要解释的
+
+**`compute` 的 1.6x 是 JIT 预热，不是稳态。** 同一个循环在一个 JVM 里跑三遍：
+
+```
+runc      pass1 212ms  pass2 208ms  pass3 201ms
+systrap   pass1 329ms  pass2 248ms  pass3 201ms   ← 第三遍与 runc 完全相同
+ptrace    pass1 348ms  pass2 313ms  pass3 223ms
+```
+
+**JIT 编译完之后，Java 代码在 systrap 上就是原生速度。** 沙箱的代价全在预热期
+（编译器线程本身要做大量 mmap 和跨线程同步）。
+
+**`alloc` 的 28x 是 G1，不是沙箱的内存路径。** 换 GC 实测（systrap）：
+
+```
+默认（G1，堆自动伸缩）                        13532ms
+G1 + 固定 1g 堆                                5415ms
+SerialGC + 固定 1g 堆                           503ms   ← 与 runc 的 410-500ms 持平
+SerialGC + 固定 1g 堆 + AlwaysPreTouch          498ms
+```
+
+G1 的并发标记线程、写屏障和 remembered set 维护都要频繁跨线程同步，而这正是 gVisor
+最贵的操作。堆伸缩占了约六成，G1 的并发部分占了剩下的。**换 SerialGC + 固定堆，
+分配密集型负载从 28x 直接回到 1.2x。**
+
+**`Thread create+join` 的 348x 换 GC 参数无效**（各种组合都是 55-57ms），
+因为它是那个 futex 屏障——见上一节：join 一个刚退出的线程要等一个 RCU 宽限期。
+线程池（`pool`）复用线程，所以"只"有 15.6x。
+
+### 启动调优
+
+```
+java Hello 墙钟（systrap）
+默认                                                       2.85 / 3.15s
+-XX:TieredStopAtLevel=1                                    1.95 / 1.91s   -35%
+-XX:+UseSerialGC -Xms256m -Xmx256m                         2.75 / 2.78s
+-XX:+UseSerialGC -Xms256m -Xmx256m -XX:TieredStopAtLevel=1 1.90 / 1.81s   -38%
+-Xshare:off                                                2.88 / 2.83s
+runc 对这些参数不敏感（0.49-0.56s）
+```
+
+### 建议
+
+- **长期运行的服务**：`-XX:+UseSerialGC -Xms<N> -Xmx<N>`（堆固定、别用 G1）。
+  分配密集的部分能回到接近原生；JIT 预热之后计算部分就是原生速度。
+  不要加 `TieredStopAtLevel=1`，它把 JIT 限制在 C1，长跑吞吐会掉。
+- **短命的 CLI（`javac`、构建脚本）**：再加 `-XX:TieredStopAtLevel=1`，启动少三分之一。
+  但 5x 的启动开销去不掉，`javac` 这类每次起一个 JVM 的用法在沙箱里代价很高。
+- **避免频繁 `new Thread().start()/join()`**，用线程池。前者 348x，后者 15.6x。
