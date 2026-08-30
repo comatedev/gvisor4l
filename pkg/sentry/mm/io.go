@@ -461,12 +461,17 @@ func (mm *MemoryManager) CompareAndSwapUint32(ctx context.Context, addr hostarch
 	return prev, err
 }
 
-// MemoryBarrier issues a host global memory barrier so writes by peer tasks
-// (stub processes) sharing this address space become globally visible to the
-// sentry. Required on weakly-ordered platforms (LoongArch) where the ptrace
-// futex path reads peer stub memory without the on-CPU barrier a native
-// futex_wake provides. No-op if the platform lacks a global barrier.
+// MemoryBarrier issues a host global memory barrier so that writes by peer
+// tasks (stub processes) sharing this address space become globally visible to
+// the sentry.
+//
+// It does nothing unless the platform asked for it; see
+// mm.SetFutexGlobalBarrier, which explains why it is expensive and which
+// platform needs it.
 func (mm *MemoryManager) MemoryBarrier() {
+	if !futexGlobalBarrier.Load() {
+		return
+	}
 	if mm.p.HaveGlobalMemoryBarrier() {
 		_ = mm.p.GlobalMemoryBarrier()
 	}

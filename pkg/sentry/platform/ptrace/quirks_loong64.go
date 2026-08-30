@@ -32,4 +32,8 @@ import "gvisor.dev/gvisor/pkg/sentry/mm"
 // to prefer systrap on this architecture.
 func declarePlatformQuirks() {
 	mm.SetEagerFaultWorkaround(true)
+	// The futex barrier was added here for a JVM that deadlocked during
+	// startup. It has not been retested against this platform since, so it
+	// stays on; see mm.SetFutexGlobalBarrier for what it costs.
+	mm.SetFutexGlobalBarrier(true)
 }

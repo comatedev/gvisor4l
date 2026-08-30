@@ -47,3 +47,27 @@ func SetEagerFaultWorkaround(v bool) {
 func EagerFaultWorkaround() bool {
 	return eagerFaultWorkaround.Load()
 }
+
+// futexGlobalBarrier makes MemoryManager.MemoryBarrier issue a host global
+// memory barrier, which futex.WaitPrepare asks for before it puts a task to
+// sleep.
+//
+// It exists for the same platform as eagerFaultWorkaround and for a related
+// reason: the value a futex sleeps on was written by a peer stub process, and
+// under ptrace the sentry reads that memory without the ordering a native
+// futex_wake would have provided on the writing CPU.
+//
+// It is off by default. The barrier is membarrier(MEMBARRIER_CMD_GLOBAL),
+// which the kernel implements as synchronize_rcu(), so it waits out a
+// system-wide RCU grace period -- 15.6ms on an idle machine, measured. That is
+// per futex sleep.
+var futexGlobalBarrier atomic.Bool
+
+// SetFutexGlobalBarrier records that this platform needs a global memory
+// barrier before a task sleeps on a futex.
+//
+// A platform that needs it MUST call this during initialization, before any
+// guest runs.
+func SetFutexGlobalBarrier(v bool) {
+	futexGlobalBarrier.Store(v)
+}
