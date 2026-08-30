@@ -15,7 +15,6 @@
 package ptrace
 
 import (
-	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -96,12 +95,6 @@ func (t *thread) transferFPRegs(fpState *fpu.State, ac *archContext, req uintptr
 			rs.note,
 			uintptr(unsafe.Pointer(&iovec)),
 			0, 0)
-		// The kernel writes back how much it actually transferred; a short
-		// count is the difference between "succeeded" and "did what we asked".
-		if uint64(rs.length) != iovec.Len && debugShortCount.Add(1) <= 20 {
-			log.Warningf("ptrace regset %#x req %#x: asked %d bytes, kernel moved %d",
-				rs.note, req, rs.length, iovec.Len)
-		}
 		if errno != 0 {
 			if rs.optional {
 				log.Warningf("ptrace regset %#x (%d bytes at +%d) req %#x failed: %v",
@@ -110,43 +103,8 @@ func (t *thread) transferFPRegs(fpState *fpu.State, ac *archContext, req uintptr
 			}
 			return errno
 		}
-		debugVerifyRegSet(t, fpState, rs, req)
 	}
 	return nil
-}
-
-// debugVerifyRegSet reads a regset straight back after writing it and reports
-// any difference. The vector state is still being lost even though every
-// transfer reports success, so this distinguishes 'the kernel did not take our
-// write' from 'something else drops it later'. Debug aid; rate limited.
-var debugVerifyCount atomic.Int64
-var debugShortCount atomic.Int64
-
-func debugVerifyRegSet(t *thread, fpState *fpu.State, rs fpRegSetSpec, req uintptr) {
-	if req != unix.PTRACE_SETREGSET || rs.note != linux.NT_LOONGARCH_LASX {
-		return
-	}
-	if n := debugVerifyCount.Add(1); n > 40 {
-		return
-	}
-	var back [64]byte
-	iovec := unix.Iovec{Base: &back[0], Len: uint64(len(back))}
-	if _, _, errno := unix.RawSyscall6(
-		unix.SYS_PTRACE, unix.PTRACE_GETREGSET, uintptr(t.tid), rs.note,
-		uintptr(unsafe.Pointer(&iovec)), 0, 0); errno != 0 {
-		log.Warningf("LASX readback failed: %v", errno)
-		return
-	}
-	wrote := (*fpState)[rs.offset : rs.offset+len(back)]
-	same := true
-	for i := range back {
-		if back[i] != wrote[i] {
-			same = false
-			break
-		}
-	}
-	log.Warningf("LASX set/readback tid=%d match=%v wrote=%x back=%x",
-		t.tid, same, wrote[:32], back[:32])
 }
 
 // getFPRegs gets the floating-point data via the GETREGSET ptrace unix.

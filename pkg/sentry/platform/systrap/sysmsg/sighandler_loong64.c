@@ -400,11 +400,20 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
   // yet reports SEGV_MAPERR and is handled as a read; the sentry then maps
   // the page read-only and the retried store takes the SEGV_ACCERR path, so
   // it costs one extra fault rather than looping.
+  //
+  // The two bits are exclusive. An instruction fetch that is refused reports
+  // SEGV_ACCERR just as a store does, so testing them independently would mark
+  // a fetch as a write, and the sentry would then refuse it against a vma that
+  // is executable but not writable. A data access whose address happens to
+  // equal the faulting instruction's own address would have to be a store into
+  // the instruction currently executing, which cannot happen.
   ctx->err = 0;
   if (signo == SIGSEGV || signo == SIGBUS) {
-    if (siginfo->si_code == SEGV_ACCERR) ctx->err |= LOONG_FAULT_WRITE;
-    if ((uint64_t)siginfo->si_addr == ucontext->uc_mcontext.__pc)
+    if ((uint64_t)siginfo->si_addr == ucontext->uc_mcontext.__pc) {
       ctx->err |= LOONG_FAULT_INSTR;
+    } else if (siginfo->si_code == SEGV_ACCERR) {
+      ctx->err |= LOONG_FAULT_WRITE;
+    }
   }
 
   switch (signo) {
