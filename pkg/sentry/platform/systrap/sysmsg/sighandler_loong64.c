@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #define _GNU_SOURCE
+#include <asm/ptrace.h>
 #include <asm/sigcontext.h>
 #include <asm/unistd.h>
 #include <errno.h>
@@ -43,6 +44,48 @@ uint64_t __export_disable_syscall_patching;
 #define LOONG_FAULT_WRITE (1 << 0)
 #define LOONG_FAULT_INSTR (1 << 1)
 // LINT.ThenChange(../subprocess_loong64.go)
+
+// The sentry keeps floating-point state in the layout of the ptrace regsets
+// laid end to end -- see pkg/sentry/arch/fpu/fpu_loong64.go -- because that is
+// what the ptrace platform moves with PTRACE_GETREGSET and what the rest of
+// the sentry reads. The signal frame carries the same state in a different
+// shape: a chain of sc_extcontext records. The stub converts between the two,
+// so a thread_context describes FP state identically no matter which platform
+// filled it.
+//
+// LINT.IfChange
+#define FPSTATE_FPREGS_OFFSET 0
+#define FPSTATE_LSX_OFFSET    272
+#define FPSTATE_LASX_OFFSET   784
+#define FPSTATE_LBT_OFFSET    1808
+#define FPSTATE_LEN           1856
+// LINT.ThenChange(../../../arch/fpu/fpu_loong64.go)
+
+// The regset and sigcontext forms of the base FP file are the same bytes in
+// the same order, which is what makes the FPU case below a single memcpy.
+_Static_assert(sizeof(struct user_fp_state) == sizeof(struct fpu_context),
+               "user_fp_state and fpu_context must agree");
+_Static_assert(sizeof(struct user_fp_state) == 272, "");
+_Static_assert(sizeof(struct user_lsx_state) == 512, "");
+_Static_assert(sizeof(struct user_lasx_state) == 1024, "");
+_Static_assert(sizeof(struct user_lbt_state) == sizeof(struct lbt_context),
+               "user_lbt_state and lbt_context must agree");
+_Static_assert(sizeof(struct user_lbt_state) == 40, "");
+_Static_assert(FPSTATE_LSX_OFFSET == sizeof(struct user_fp_state), "");
+_Static_assert(FPSTATE_LASX_OFFSET ==
+                   FPSTATE_LSX_OFFSET + sizeof(struct user_lsx_state),
+               "");
+_Static_assert(FPSTATE_LBT_OFFSET ==
+                   FPSTATE_LASX_OFFSET + sizeof(struct user_lasx_state),
+               "");
+_Static_assert(FPSTATE_LEN >= FPSTATE_LBT_OFFSET + sizeof(struct user_lbt_state),
+               "");
+_Static_assert(FPSTATE_LEN <= MAX_FPSTATE_LEN, "");
+
+// Offsets of fcc and fcsr inside the base FP regset. LSX and LASX carry their
+// own copies of both, but the regsets for them do not, so they land here.
+#define FPSTATE_FCC_OFFSET  offsetof(struct user_fp_state, fcc)
+#define FPSTATE_FCSR_OFFSET offsetof(struct user_fp_state, fcsr)
 
 // LoongArch has no sa_restorer, so the handler cannot return -- see
 // sigrestorer_loong64.S. It tail-calls this with the rt_sigframe base instead.
@@ -100,15 +143,9 @@ static void ptregs_to_gregs(ucontext_t *ucontext,
 }
 
 // Floating point and vector state reaches the handler as a chain of sctx_info
-// records in sc_extcontext -- FPU, then LSX or LASX, then LBT, terminated by a
-// record with magic zero. Measured on a 3A5000 the first record is
-// LASX_CTX_MAGIC at 1056 bytes, so the whole chain is well under
-// MAX_FPSTATE_LEN.
-//
-// Carrying the chain verbatim is what lets systrap preserve vector state at
-// all: the ptrace platform moves FP state with PTRACE_GETREGSET and loses the
-// upper 192 bits of every LASX register, whereas rewriting these records was
-// measured to take effect on all four lanes.
+// records in sc_extcontext -- FPU, or LSX, or LASX depending on the widest
+// unit the thread has touched, optionally followed by LBT, terminated by a
+// record with magic zero.
 //
 // Returns the total length including the terminating record, or 0 if the chain
 // is malformed.
@@ -120,6 +157,111 @@ static uint32_t extctx_len(const uint8_t *base) {
     if (h->magic == 0) return off + (uint32_t)sizeof(*h);
     if (h->size < sizeof(*h)) return 0;
     if (off + h->size > MAX_FPSTATE_LEN) return 0;
+    off += h->size;
+  }
+}
+
+// extctx_to_fpstate converts the signal frame's record chain into the regset
+// layout the sentry keeps.
+//
+// The wider units are supersets of the narrower ones in the hardware but not
+// in the regsets, which are separate buffers, so an LASX record fills the LASX,
+// LSX and base FP areas rather than only its own. That way the sentry's view is
+// complete whichever record the kernel happened to emit, which matters because
+// the kernel emits only the widest one the thread has used.
+//
+// Precondition: the chain has been validated by extctx_len.
+static void extctx_to_fpstate(uint8_t *frame, uint8_t *fp) {
+  uint32_t off = 0;
+  for (;;) {
+    struct sctx_info *h = (struct sctx_info *)(frame + off);
+    if (h->magic == 0) return;
+    uint8_t *body = frame + off + sizeof(*h);
+
+    switch (h->magic) {
+      case FPU_CTX_MAGIC: {
+        // Identical layouts; see the static assert above.
+        memcpy(fp + FPSTATE_FPREGS_OFFSET, body, sizeof(struct fpu_context));
+        break;
+      }
+      case LSX_CTX_MAGIC: {
+        struct lsx_context *c = (struct lsx_context *)body;
+        memcpy(fp + FPSTATE_LSX_OFFSET, (uint8_t *)c->regs, sizeof(c->regs));
+        for (int i = 0; i < 32; i++)
+          memcpy(fp + FPSTATE_FPREGS_OFFSET + i * 8, (uint8_t *)&c->regs[i * 2], 8);
+        memcpy(fp + FPSTATE_FCC_OFFSET, (uint8_t *)&c->fcc, sizeof(c->fcc));
+        memcpy(fp + FPSTATE_FCSR_OFFSET, (uint8_t *)&c->fcsr, sizeof(c->fcsr));
+        break;
+      }
+      case LASX_CTX_MAGIC: {
+        struct lasx_context *c = (struct lasx_context *)body;
+        memcpy(fp + FPSTATE_LASX_OFFSET, (uint8_t *)c->regs, sizeof(c->regs));
+        for (int i = 0; i < 32; i++) {
+          memcpy(fp + FPSTATE_LSX_OFFSET + i * 16, (uint8_t *)&c->regs[i * 4], 16);
+          memcpy(fp + FPSTATE_FPREGS_OFFSET + i * 8, (uint8_t *)&c->regs[i * 4], 8);
+        }
+        memcpy(fp + FPSTATE_FCC_OFFSET, (uint8_t *)&c->fcc, sizeof(c->fcc));
+        memcpy(fp + FPSTATE_FCSR_OFFSET, (uint8_t *)&c->fcsr, sizeof(c->fcsr));
+        break;
+      }
+      case LBT_CTX_MAGIC: {
+        memcpy(fp + FPSTATE_LBT_OFFSET, body, sizeof(struct lbt_context));
+        break;
+      }
+      default:
+        // An extension this build does not know about. Leaving it alone is
+        // the only safe choice: it stays whatever the kernel put there for
+        // this thread.
+        break;
+    }
+    off += h->size;
+  }
+}
+
+// fpstate_to_extctx writes the sentry's regset layout back into the signal
+// frame, filling only the records the frame already has. The frame's chain is
+// the one the kernel built for this thread and its length is fixed, so records
+// are never added or removed -- a context that has state for a unit this frame
+// does not carry simply does not get it restored, and vice versa.
+//
+// Where a record's contents overlap another regset -- an LASX record covers
+// what the base FP regset also holds -- the wider regset wins, matching the
+// order in which the ptrace platform writes them.
+//
+// Precondition: both chains have been validated by extctx_len.
+static void fpstate_to_extctx(uint8_t *fp, uint8_t *frame) {
+  uint32_t off = 0;
+  for (;;) {
+    struct sctx_info *h = (struct sctx_info *)(frame + off);
+    if (h->magic == 0) return;
+    uint8_t *body = frame + off + sizeof(*h);
+
+    switch (h->magic) {
+      case FPU_CTX_MAGIC: {
+        memcpy(body, fp + FPSTATE_FPREGS_OFFSET, sizeof(struct fpu_context));
+        break;
+      }
+      case LSX_CTX_MAGIC: {
+        struct lsx_context *c = (struct lsx_context *)body;
+        memcpy((uint8_t *)c->regs, fp + FPSTATE_LSX_OFFSET, sizeof(c->regs));
+        memcpy((uint8_t *)&c->fcc, fp + FPSTATE_FCC_OFFSET, sizeof(c->fcc));
+        memcpy((uint8_t *)&c->fcsr, fp + FPSTATE_FCSR_OFFSET, sizeof(c->fcsr));
+        break;
+      }
+      case LASX_CTX_MAGIC: {
+        struct lasx_context *c = (struct lasx_context *)body;
+        memcpy((uint8_t *)c->regs, fp + FPSTATE_LASX_OFFSET, sizeof(c->regs));
+        memcpy((uint8_t *)&c->fcc, fp + FPSTATE_FCC_OFFSET, sizeof(c->fcc));
+        memcpy((uint8_t *)&c->fcsr, fp + FPSTATE_FCSR_OFFSET, sizeof(c->fcsr));
+        break;
+      }
+      case LBT_CTX_MAGIC: {
+        memcpy(body, fp + FPSTATE_LBT_OFFSET, sizeof(struct lbt_context));
+        break;
+      }
+      default:
+        break;
+    }
     off += h->size;
   }
 }
@@ -151,15 +293,14 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
 
   {
     uint8_t *extctx = (uint8_t *)ucontext->uc_mcontext.__extcontext;
-    uint32_t len = extctx_len(extctx);
-    if (len == 0) {
+    if (extctx_len(extctx) == 0) {
       // Read the magic through memcpy: __extcontext is declared as an array of
       // unsigned long long, and casting it to uint32_t* trips strict aliasing.
       uint32_t magic;
       memcpy((uint8_t *)&magic, extctx, sizeof(magic));
       panic(STUB_ERROR_FPSTATE_BAD_HEADER, magic);
     }
-    memcpy(ctx->fpstate, extctx, len);
+    extctx_to_fpstate(extctx, ctx->fpstate);
   }
 
   ctx->tls = get_tls();
@@ -233,16 +374,12 @@ void restore_state(struct sysmsg *sysmsg, struct thread_context *ctx,
 
   if (atomic_load(&ctx->fpstate_changed)) {
     uint8_t *extctx = (uint8_t *)ucontext->uc_mcontext.__extcontext;
-    uint32_t saved = extctx_len(ctx->fpstate);
-    uint32_t frame = extctx_len(extctx);
-    // The kernel emits the same chain shape for every frame on a given CPU, so
-    // a mismatch means the saved state does not belong to this frame. Writing
-    // it anyway would either overrun the frame or leave a malformed chain, so
-    // say so instead of guessing.
-    if (saved == 0 || saved != frame) {
-      panic(STUB_ERROR_FPSTATE_BAD_HEADER, saved);
+    if (extctx_len(extctx) == 0) {
+      uint32_t magic;
+      memcpy((uint8_t *)&magic, extctx, sizeof(magic));
+      panic(STUB_ERROR_FPSTATE_BAD_HEADER, magic);
     }
-    memcpy(extctx, ctx->fpstate, saved);
+    fpstate_to_extctx(ctx->fpstate, extctx);
   }
   ptregs_to_gregs(ucontext, &ctx->ptregs);
   set_tls(ctx->tls);

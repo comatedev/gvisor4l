@@ -21,6 +21,8 @@ import (
 	_ "embed"
 	"fmt"
 	"strings"
+
+	"gvisor.dev/gvisor/pkg/cpuid"
 )
 
 // maxFPStateLen is smaller here than on the other architectures: ThreadContext
@@ -28,10 +30,9 @@ import (
 // user_regs_struct is 360 bytes against arm64's 272, which pushes the struct
 // past 4096 at 3584. See MAX_FPSTATE_LEN in sysmsg_offsets.h, which must agree.
 //
-// The room is ample either way. What the stub saves here is the sigcontext
-// extended context record chain the kernel builds on signal entry, and the
-// longest chain a task can produce is an LASX record (1056 bytes) plus an LBT
-// record (56) plus the 16-byte terminator.
+// The room is ample: what lives here is the ptrace regset layout the sentry
+// keeps (fpu.State, 1856 bytes), which the stub converts to and from the
+// signal frame's sc_extcontext record chain.
 const maxFPStateLen uint32 = 2048
 
 // SighandlerBlob contains the compiled code of the sysmsg signal handler.
@@ -45,14 +46,10 @@ type ArchState struct {
 }
 
 // Init initializes the arch specific state.
-//
-// Unlike amd64 and arm64 this does not ask cpuid for the extended state size.
-// The stub does not decide how much to copy from a length in arch_state: the
-// record chain in the signal frame is self-delimiting, so sighandler_loong64.c
-// walks it and copies exactly what is there. fpLen only bounds the sentry-side
-// copies in saveFPState/restoreFPState, which move whole FPState buffers.
 func (s *ArchState) Init() {
-	s.fpLen = maxFPStateLen
+	fs := cpuid.HostFeatureSet()
+	fpLenUint, _ := fs.ExtendedStateSize()
+	s.fpLen = uint32(fpLenUint)
 }
 
 // FpLen returns the FP state length for LoongArch.

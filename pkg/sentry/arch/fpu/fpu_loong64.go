@@ -51,6 +51,8 @@ const (
 	// FeatureSet is the guest-visible one and AllowedHWCap1 filters both out,
 	// so HasFeature(LASX) is false even on hardware that has it. Attempt each
 	// instead and let the kernel reject what it does not implement.
+	//
+	// LINT.IfChange
 	LoongLSXOffset = LoongFPRegsOffset + LoongFPRegsSize
 	LoongLSXSize   = 512
 
@@ -61,11 +63,13 @@ const (
 	LoongLBTSize   = 40
 
 	// loongFPUStateSize is the total, rounded up to 16-byte alignment.
-	loongFPUStateSize = (LoongLBTOffset + LoongLBTSize + 15) &^ 15 // 1344
+	loongFPUStateSize = (LoongLBTOffset + LoongLBTSize + 15) &^ 15 // 1856
+	// LINT.ThenChange(../../platform/systrap/sysmsg/sighandler_loong64.c)
 )
 
 // initLoongFPState resets the state to the canonical "clean" values.
-// fcsr / fcc default to zero; floating-point registers are don't-care.
+// fcsr / fcc default to zero; floating-point registers are don't-care, so an
+// all-zero buffer is already the clean state and there is nothing to do.
 func initLoongFPState(data *State) {
 }
 
