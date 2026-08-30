@@ -92,14 +92,12 @@ func (image *TaskImage) Fork(ctx context.Context, k *Kernel, shareAddressSpace b
 		}
 		newImage.MemoryManager = newMM
 		newImage.fu = k.futexes.Fork()
-		// LoongArch: break COW eagerly on both parent and child mm. The first
-		// write to a COW page after fork would otherwise take the kernel
-		// COW-fault (PME) SIGSEGV path, which does not restore page-walk
-		// temporaries t0/t1 and corrupts application registers.
+		// No-ops unless the platform cannot take a lazy fault safely; see
+		// mm.SetEagerFaultWorkaround. Parent first: once the parent has broken
+		// copy-on-write, the child holds the only reference to the original
+		// pages, so its pass takes the HasUniqueRef fast path in
+		// isPMACopyOnWriteLocked and re-owns them without copying.
 		image.MemoryManager.PopulateAll(ctx)
-		// Parent first: once the parent has broken COW, the child holds the only
-		// reference to the original pages, so its pass takes the HasUniqueRef
-		// fast path in isPMACopyOnWriteLocked and re-owns them without copying.
 		newMM.PopulateAll(ctx)
 	}
 	return newImage, nil
@@ -161,8 +159,7 @@ func (k *Kernel) LoadTaskImage(ctx context.Context, args loader.LoadArgs) (*Task
 	if err != nil {
 		return nil, nil, false, err
 	}
-	// LoongArch: eagerly map all loader-created memory before the application
-	// runs, to avoid the kernel SIGSEGV fault path that clobbers t0/t1.
+	// No-op unless the platform cannot take a lazy fault safely.
 	m.PopulateAll(ctx)
 
 	// Lookup our new syscall table.

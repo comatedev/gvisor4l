@@ -234,6 +234,10 @@ type PTrace struct {
 // New returns a new ptrace-based implementation of the platform interface.
 func New() (*PTrace, error) {
 	stubInitialized.Do(func() {
+		// Tell the sentry what this platform can and cannot do, before any
+		// guest runs.
+		declarePlatformQuirks()
+
 		// Initialize the stub.
 		stubInit()
 
