@@ -1892,3 +1892,41 @@ MariaDB、Java、shell 均正常。ptrace 下 `veccheck` 仍然失败——那�
   但要先验证 systrap 下去掉它是否安全（当初是为 JVM 启动死锁加的）。
 - `membarrier` 的 `PRIVATE_EXPEDITED` 自动注册（#6）：偏离 Linux 语义，无测试覆盖。
 - `/proc/stat` 伪造常量（#7）：汇总行与 per-CPU 行用同一份数据，4 核时汇总 ≠ 明细之和。
+
+### ⑤ futex 屏障：收进平台开关，systrap 不再付这个代价 (2026-08-31)
+
+评审 #5：`futex.WaitPrepare` 里那个类型断言恒真（`kernel.Task` 实现了 `MemoryBarrier()`），
+所以**所有平台、所有架构**每次 futex 真正阻塞前都在持 bucket 锁的情况下发一次
+`membarrier(MEMBARRIER_CMD_GLOBAL)` = `synchronize_rcu()`，空闲机器上 15.6ms。
+
+这就是"join 一个刚退出的线程要 15.6ms、而创建只要 195µs、join 一个已经退出的只要 541µs"
+的全部原因，也是 Java `Thread create+join` 348x 的来源。
+
+改成和旁边的 eager-fault 同一个套路：默认关，ptrace 保留（当初就是在 ptrace 上为 JVM
+启动死锁加的，没有针对那个平台重测过），systrap 不要——理由是 stub 对 futex 字的写，
+在 sentry 看到请求之前就已经被 sysmsg 上下文切换本身的 release/acquire 定序了。
+
+实测（loong64/systrap）：
+
+```
+Thread create+join (C)      18.36ms -> 0.118ms     155x
+Java park/unpark             257us  -> 24us/hop     10.7x
+futex ping-pong (C)          22.1us -> 10.1us
+```
+
+丢唤醒会表现为挂死，所以用量堆验证：**50 次 JVM 启动跑完整 JBench，加 10 轮 ×
+200,000 次 park/unpark 交接（合计 200 万次）**，零失败零挂死。移植文档当初自己的标准是
+50 次 JVM 启动 + 15,000 次。另外 systrap 下 `veccheck` 236 万次、`09-sigroundtrip`
+3000 轮全清，MariaDB 浸泡 100 轮 × 2 组零失败。ptrace 行为不变。
+
+### 两处改动合计的效果（生产 runtime 实测）
+
+```
+                        改之前      改之后
+fork+exit+wait          10.40ms    0.87ms
+fork+exec+wait          13.97ms    1.96ms
+thread create+join      18.36ms    0.116ms
+mmap+touch+munmap        82.7us    65.2us
+```
+
+其余项（syscall、stat、文件 IO、memcpy）不变。
