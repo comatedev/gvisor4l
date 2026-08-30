@@ -1277,3 +1277,110 @@ raw binary: 4032 字节
 __export_restore_rt / __export_sighandler / __export_start / ... 全部导出
 向量指令: 0    浮点指令: 0
 ```
+
+## systrap 移植：跑起来了，向量状态问题随之解决 (2026-08-30)
+
+blob 之后是 Go 侧约 600 行，以及把此前 23 个文件上的 `!loong64` 构建标签摘掉。
+`platforms_loong64.go` 现在也 import systrap，`--platform=systrap` 可选。kvm 仍在门外。
+
+大部分是 arm64 版的直译，不同的地方有四处。
+
+### `stub_loong64.s`：长期状态只能放 `$s` 寄存器
+
+arm64 版把 sentry 消息指针、状态计数器放在 `$x12/$x13/$x19`。loong64 不能照抄：
+本移植早先实测过**内核不保证 `$t0-$t8` 跨 syscall 存活**（会漏出 `0x9000...` 直接映射地址），
+所以全部改用 `$s0-$s4`。`$s2` 存 futex 字地址，且**每轮循环都要重新装进 `$a0`**——
+`$a0` 回来时是 syscall 返回值，循环外准备的东西一个都不剩。
+（upstream arm64 那段把 `$x0` 也放在循环外准备，同样会被 `SVC` 冲掉；那边退化成
+自旋而非出错，所以一直没暴露。）
+
+状态计数器的比较要注意符号扩展：`ld.w` 和 `addi.w` 都做符号扩展，而 LoongArch 没有
+32 位比较跳转（arm64 用 `CMPW` 绕过），所以计数超过 2^31 后两边就不再相等。
+`syscall_thread_loong64.go` 那侧也跟着符号扩展。
+
+汇编产物逐条反汇编核对过；`+checkconst` / `+checkoffset` 由 nogo 对着 Go 常量和结构体
+偏移检查，`bazel build --config=loong64 //pkg/sentry/platform/systrap:systrap_nogo` 通过。
+
+### `systrap_loong64_unsafe.go`：TLS 就是个普通寄存器
+
+arm64 要靠 `NT_ARM_TLS` regset 存取 `TPIDR_EL0`，loong64 的线程指针是 `$tp`（`$r2`），
+随 `NT_PRSTATUS` 一起来，读写寄存器即可。`archSyscallFilters()` 因此是空的。
+
+### `sigErrorToAccessType`：信号帧里没有故障状态寄存器
+
+arm64 从 `esr_context` 读访问类型，loong64 的信号帧里没有对应物，只能由 stub 合成。
+写位不是靠猜指令：`SEGV_ACCERR` 表示映射存在但访问被拒，而 sentry 装的宿主映射至少可读，
+所以被拒的访问就是往只读页写。往还没有宿主映射的地址写会报 `SEGV_MAPERR`，按读处理，
+sentry 随后把页只读映射上去，重试的写就走到 `ACCERR` 那条路——代价是多一次缺页，不会打转。
+
+### `sysmsgSigactions` 之前在所有架构上都传 `linux.SigAction`
+
+loong64 没有 `__ARCH_HAS_SA_RESTORER`，`struct sigaction` 里没有 `sa_restorer`，
+`sa_mask` 在偏移 16。照原样传下去，内核会把 restorer 地址当成信号掩码读，
+**每个 stub 线程都会屏蔽掉一组任意信号**。改成按架构构造（`newHostSigAction`）。
+loong64 那版也不设 `SA_RESTORER`：handler 从不返回到内核的 restorer，
+`sighandler_loong64.c` 尾调用 `__export_restore_rt` 自发 `rt_sigreturn`，因为 stub 没有 vdso 可走。
+
+## 挡住第一次启动的两个 bug (2026-08-30)
+
+### 地址空间是 47 位，不是 48
+
+16K 页下一级页表索引 16384/8 = 2048 项，四级走到 14 + 11×3 = **47** 位。
+`mm_loong64.go` 早就探测出 `1 << 47`，`arch_loong64.go` 却写着 `1 << 48`，
+于是 systrap 一上来就在 `ConfigureAddressSpace(linux.TaskSize)` 里 panic。
+
+ptrace 平台不调这个函数所以没发现，但它读的是同一个常量：
+`preferredPIELoadAddr` 由 `maxAddr64` 推出来，坐在 `0xd5555...`，
+高过宿主能给出的任何地址，**PIE 程序从来没有被加载到 Linux 会加载的位置**。
+`preferredTopDownAllocMin` 同样是按 48 位窗口定的，按比例减半；
+`NewMmapLayout` 的随机化两种取值下都不受影响。
+
+### stub 没有填 `pt_regs.orig_a0`
+
+sentry 从 `orig_a0` 取第一个 syscall 参数（`$a0` 兼作返回值寄存器），
+ptrace 平台从 `NT_PRSTATUS` 里拿得到，但 **`struct sigcontext` 只有
+`sc_pc` / `sc_regs[32]` / `sc_flags`，没有 `orig_a0`**，systrap 必须自己填。
+
+帧里的 `$a0` 此刻仍是实参——用 `SECCOMP_RET_TRAP` 过滤器在 3A5000 上实测确认
+（`05-sigsys-a0`：传 `0x1111222233334444`，handler 看到的就是它，不是内核随后写的 `-ENOSYS`）。
+
+症状是 `/bin/echo` 死在 ld.so 里报 `failed to map segment from shared object`：
+它给 libc 数据段做的 `MAP_FIXED` mmap 请求的地址是 0。
+
+## 向量状态：systrap 上修好了 (2026-08-30)
+
+`veccheck`（置 `$xr0-$xr7`、过一次 syscall 和一次 yield、读回）在 systrap 上
+一开始 **30 次以内就失败**，signature 和 ptrace 上一模一样：lane 0 完好，高 192 位读成 `~0`。
+
+原因不在搬运代码，在**帧的形状**：`arch/loongarch/kernel/signal.c` 的
+`setup_extcontext()` 只在线程处于 LSX / LASX context live 时才往帧里放向量记录，
+而线程是**第一次陷入向量单元**时才变 live 的。一个还没跑过用向量的 guest 代码的
+sysmsg 线程拿到的是 FPU-only 的帧，`restore_state` 就没地方写向量状态——
+上下文在 A 线程用了 LASX、迁移到 B 线程后，只有 lane 0 回来，其余是 `init_fp_ctx()`
+留下的 `~0`。做了个诊断版本，帧首条记录不是 LASX 就 panic，确认会触发。
+
+于是 **stub 在线程初始化时执行一条向量指令**，按 CPUCFG word 2 选：有 LASX 用 LASX 形式，
+只有 LSX 用 LSX 形式，都没有就不做。两条都是恒等式（寄存器和自己相或），
+变 live 只会破坏高位 lane，而那时还没有 guest 上下文。
+
+此刻手上的帧是变 live *之前*建的，还没有向量记录，所以 handler 从它返回、
+让线程再故障一次去换一个新帧：sentry 给新 sysmsg 线程装的是全零寄存器组、`era` 为 0，
+返回就重新执行同一次取指故障，回到 handler。`$s0` 记录这件事已经做过，
+所以即使第二个帧仍然没有向量记录也只会来一次。
+
+构建期"blob 里不得有浮点或向量指令"的断言保留，只跳过 `touch_vector_unit`
+（为此编译成 noinline，好让断言点名）。编译器生成的 `.L` 块属于它上面那个函数，
+不能重置跳过状态——不加这一条，断言会放过落在某个 `.L` 块里的 `vor.v`。
+
+### 实测
+
+```
+veccheck  4 线程 60 秒
+  ptrace   第 52 次迭代失败
+  systrap  7,273,186 次迭代，0 失败
+
+09-sigroundtrip  应用向量状态跨 guest 信号
+  裸机     2000 轮 0 失败
+  systrap  2000 轮 0 失败
+  ptrace   2000 轮 1 失败
+```
