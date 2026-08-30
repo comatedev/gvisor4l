@@ -205,7 +205,10 @@ const (
 const (
 	// MaxFPStateLen is the largest possible FPState that we will save.
 	// Note: This value was chosen to be able to fit ThreadContext into one page.
-	MaxFPStateLen uint32 = 3584
+	// It is architecture specific because the rest of ThreadContext is: see
+	// maxFPStateLen in the per-architecture files, and MAX_FPSTATE_LEN in
+	// sysmsg_offsets.h, which must agree.
+	MaxFPStateLen uint32 = maxFPStateLen
 
 	// AllocatedSizeofThreadContextStruct defines how much memory to allocate for
 	// one instance of ThreadContext.

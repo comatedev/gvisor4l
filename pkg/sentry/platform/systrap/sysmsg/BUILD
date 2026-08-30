@@ -98,6 +98,7 @@ genrule(
 
 arch_genrule(
     name = "sighandler_binary_arch",
+    loong64 = True,
     src = ":sighandler_binary",
     template = "sighandler.built-in.%s.bin",
 )
@@ -113,6 +114,7 @@ genrule(
 
 arch_genrule(
     name = "sighandler_go_arch",
+    loong64 = True,
     src = ":sighandler_go",
     template = "sighandler_%s.go",
 )
@@ -125,6 +127,7 @@ go_library(
         "sysmsg_64k.go",
         "sysmsg_amd64.go",
         "sysmsg_arm64.go",
+        "sysmsg_loong64.go",
         "sysmsg_unsafe.go",
         ":sighandler_go_arch",
     ],

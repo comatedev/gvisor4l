@@ -25,6 +25,9 @@ import (
 	"gvisor.dev/gvisor/pkg/cpuid"
 )
 
+// maxFPStateLen is the largest FPState the stub will save. See MaxFPStateLen.
+const maxFPStateLen uint32 = 3584
+
 // SighandlerBlob contains the compiled code of the sysmsg signal handler.
 //
 //go:embed sighandler.built-in.arm64.bin

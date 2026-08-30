@@ -80,12 +80,18 @@ def amd64_config(settings, attr):
     }
 
 def loong64_config(settings, attr):
-    # Unlike amd64_config/arm64_config, this sets no cpu or crosstool_top:
-    # @crosstool is the coral crosstool, which has no loongarch64 support. It is
-    # not needed either, since //runsc:runsc is pure Go. Note that this
-    # transition is currently not wired into //tools:arch.bzl.
+    # --crosstool_top is legacy: since Bazel 7 the C++ rules resolve their
+    # toolchain from --platforms, and @bazel_tools//tools/cpp:current_cc_toolchain
+    # (tools/bazeldefs/cc.bzl) follows that resolution. It is still listed in
+    # arch_config, and a transition must define every output it declares, so
+    # pass the same value the other arches use. It is not read: @crosstool is
+    # the coral crosstool and has no loongarch64 support. The toolchain that
+    # actually gets picked is //tools/cc_toolchain_loong64, which matches on
+    # @platforms//cpu:loongarch64 from the platform below.
     return {
         "@io_bazel_rules_go//go/config:race": False,
+        "//command_line_option:cpu": "loongarch64",
+        "//command_line_option:crosstool_top": "@crosstool//:toolchains",
         "//command_line_option:platforms": "@io_bazel_rules_go//go/toolchain:linux_loong64",
     }
 
