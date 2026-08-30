@@ -1837,3 +1837,58 @@ C1only                  2.11s         4.14s
 
 所以判据不是"跑多久"，而是**有没有值得编译的热点**：
 `javac`、构建脚本、一次性 CLI 工具用 `-Xint`；有热循环的计算型任务不要用。
+
+## 代码评审：把通用代码里的 workaround 收进平台开关 (2026-08-30)
+
+一次分支级评审列出 13 条，**逐条核对全部属实**（只有一条支撑细节说错了：说 membarrier
+的改动"违反现有 syscall test"，实际 `test/syscalls/linux/membarrier.cc` 里没有 EPERM 断言，
+测试先注册再调用，捕不到）。其中八条改在**架构无关**的文件里，amd64/arm64 一起受影响。
+
+### 那一族 workaround 的前提，只对 ptrace 成立
+
+`PopulateAll`（fork 父子 + exec 后）、mmap/brk 无条件 `PlatformEffectCommit`、
+`getPMAsLocked` 传 `effectivePerms` 而非 `NoAccess`、mremap 三处 `|| true`、
+mprotect 收紧后重映射——注释都写着同一个理由："内核 TLB 例外路径不恢复 t0/t1"。
+
+用当初 v13 那个探针（`cowprobe`：fork 后子进程遍历 256MB COW 页，每轮 1.6M 次缺页）重测：
+
+| | SIGBUS |
+|---|---|
+| 上游 mm + **ptrace** | **1** / 1,638,400 |
+| 上游 mm + **systrap** | 0 / 1,638,400 |
+| 加平台开关 + ptrace（开） | 0 / 1,638,400 |
+| 加平台开关 + systrap（关） | 0 / 1,638,400 |
+
+**故障路径只在 ptrace 下不健全。** systrap 把缺页交给 stub 自己的信号处理函数、
+从 ucontext 重建寄存器组，不走内核重放那条路，同样 1.6M 次一次都没复现。
+
+注意 `t0_clobbered=0 t1_clobbered=0` 而 SIGBUS=1——**当初"不恢复 t0/t1"的机理归因很可能是错的**，
+但症状本身是真的，且确实是平台相关的。这也和后来那次大规模排查（250 万次探测全零）对上了。
+
+于是改成 `mm.SetEagerFaultWorkaround()`，与 `cpuid.SetVectorStateSaved()` 同一个套路：
+默认关闭，ptrace 在 loong64 专有文件里声明打开。amd64/arm64 和 systrap 全部拿回上游行为。
+
+省下来的（loong64/systrap 实测）：
+
+```
+fork+exit+wait     10.40ms -> 0.82ms
+fork+exec+wait     13.97ms -> 1.88ms
+mmap+touch+munmap   82.7us -> 65.0us
+```
+
+顺带补上 mprotect 重映射缺的 `mm.as != nil` 判断：`unmapASLocked` 在地址空间已释放时
+提前返回但不回滚 `didUnmapAS`，defer 里就会对 nil 的 `mm.as` 解引用。
+
+### 验证
+
+MariaDB 浸泡 120 轮 × 2 组（上游 mm / 带 workaround，都在 systrap）**全通过零失败**；
+`cowprobe` 四格如上；systrap 下 `veccheck` 237 万次、`09-sigroundtrip` 3000 轮全清，
+MariaDB、Java、shell 均正常。ptrace 下 `veccheck` 仍然失败——那是既有的向量缺陷，与本次改动无关。
+
+### 剩下三条未处理
+
+- `futex.WaitPrepare` 的全局屏障（评审 #5）：类型断言恒真，所有平台每次阻塞都发。
+  这就是线程 create+join 那 15.6ms / Java 348x 的来源。同样应该收进平台开关，
+  但要先验证 systrap 下去掉它是否安全（当初是为 JVM 启动死锁加的）。
+- `membarrier` 的 `PRIVATE_EXPEDITED` 自动注册（#6）：偏离 Linux 语义，无测试覆盖。
+- `/proc/stat` 伪造常量（#7）：汇总行与 per-CPU 行用同一份数据，4 核时汇总 ≠ 明细之和。
