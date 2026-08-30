@@ -30,8 +30,8 @@ import (
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
-	"gvisor.dev/gvisor/pkg/sentry/limits"
 	rpb "gvisor.dev/gvisor/pkg/sentry/arch/registers_go_proto"
+	"gvisor.dev/gvisor/pkg/sentry/limits"
 )
 
 // Host specifies the host architecture.
@@ -43,11 +43,11 @@ const Host = LOONGARCH64
 // $r4..$r11 are a0..a7 (the syscall ABI uses a0..a5 for arguments, a7 for
 // the syscall number, and a0 for the return value).
 const (
-	regZero = 0  // $r0  : always zero
-	regRA   = 1  // $r1  : return address
-	regTP   = 2  // $r2  : thread pointer (TLS)
-	regSP   = 3  // $r3  : stack pointer
-	regA0   = 4  // $r4  : syscall arg 0 / return
+	regZero = 0 // $r0  : always zero
+	regRA   = 1 // $r1  : return address
+	regTP   = 2 // $r2  : thread pointer (TLS)
+	regSP   = 3 // $r3  : stack pointer
+	regA0   = 4 // $r4  : syscall arg 0 / return
 	regA1   = 5
 	regA2   = 6
 	regA3   = 7

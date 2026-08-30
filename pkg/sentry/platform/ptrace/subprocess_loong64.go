@@ -116,7 +116,7 @@ func (t *thread) adjustInitRegsRip() {
 // which are clobbered by syscall entry/exit.
 func initChildProcessPPID(initregs *arch.Registers, ppid int32) {
 	initregs.Regs[23] = uint64(ppid) // $s0 = expected PPID
-	initregs.Regs[24] = 1             // $s1 = 1 marks the initial bootstrap
+	initregs.Regs[24] = 1            // $s1 = 1 marks the initial bootstrap
 }
 
 // patchSignalInfo turns a SIGSYS (raised by seccomp on a denied vsyscall

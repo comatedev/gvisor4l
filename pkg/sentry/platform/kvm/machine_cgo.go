@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //go:build cgo && amd64 && !loong64
-// +build cgo,amd64
+// +build cgo,amd64,!loong64
 
 package kvm
 

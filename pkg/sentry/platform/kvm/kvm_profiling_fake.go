@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //go:build !kvm_profiling && !loong64
-// +build !kvm_profiling
+// +build !kvm_profiling,!loong64
 
 package kvm
 

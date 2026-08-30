@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //go:build linux && !loong64
-// +build linux
+// +build linux,!loong64
 
 package kvm
 

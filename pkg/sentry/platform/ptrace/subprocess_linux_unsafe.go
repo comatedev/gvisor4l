@@ -14,7 +14,7 @@
 
 //go:build linux && (amd64 || arm64 || loong64)
 // +build linux
-// +build amd64 arm64
+// +build amd64 arm64 loong64
 
 package ptrace
 

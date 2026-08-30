@@ -34,7 +34,6 @@ type archPageTables struct{}
 // InitArch is a no-op on LoongArch64.
 func (p *PageTables) InitArch(allocator Allocator) {}
 
-
 // entriesPerPage is the number of PTE entries per page on LoongArch
 // with 16K pages and 8-byte PTEs (16384 / 8 = 2048). This matches the
 // number the ptrace platform never actually consults but the type must
@@ -113,7 +112,7 @@ func (p *PTE) IsSect() bool { return false }
 // platform never invokes the walker on LoongArch; these values exist so
 // pagetables.go and walker_generic.go compile.
 const (
-	pteSize     = 1 << 12
+	pteSize             = 1 << 12
 	lowerTop    uintptr = 1 << 47
 	upperBottom uintptr = 1 << 48
 )
